@@ -6,7 +6,7 @@ several confirmations line up. The goal is to understand the market in 3–5 sec
 chart full of indicators.
 
 - **Web app** — live at **https://clarity-smc.onrender.com** (free Render web service) with crypto, stock, index, forex and commodity data.
-- **TradingView version** — the same rules as a Pine Script v6 indicator in [`pine/clarity_smc.pine`](pine/clarity_smc.pine).
+- **TradingView version** — a Pine Script v6 indicator in [`pine/clarity_smc.pine`](pine/clarity_smc.pine) with the same ICT rules plus volume statistics, automatic stop loss and take profit ([how it works](pine/README.md)).
 
 > Setups highlight confluence only. They are not financial advice and outcomes are never guaranteed.
 
@@ -109,9 +109,15 @@ while the server wakes (the app shows a message while it waits).
 
 ## TradingView
 
-Open the Pine Editor, paste [`pine/clarity_smc.pine`](pine/clarity_smc.pine), and **Add to chart**.
-It has the same display toggles, setup confirmations, sensitivity inputs, dashboard and alerts
-(BUY SETUP, SELL SETUP, liquidity sweep, MSS).
+[`pine/clarity_smc.pine`](pine/clarity_smc.pine) is a Pine Script v6 version tuned for XAUUSD (1m–1h). It
+has the same ICT features as the web chart, plus:
+- statistical volume analysis (time-of-day relative volume, log z-score spikes, money flow, exhaustion);
+- volume-proportional bubbles with values;
+- volume-confirmed setups;
+- an automatic stop loss and three take-profit levels (risk-to-reward or ICT liquidity targets);
+- trade lines and tracking, and a full trade dashboard.
+
+See [`pine/README.md`](pine/README.md) for installation and an explanation of every calculation.
 
 ## Project layout
 
@@ -122,7 +128,8 @@ public/js/engine.js    signal engine (pure, shared with tests)
 public/js/overlay.js   canvas overlay: zones, lines, bubbles, collision-free labels
 public/js/app.js       chart, dashboard, controls, live updates
 public/js/theme.js     colour system (dark + light)
-pine/clarity_smc.pine  TradingView version
+pine/clarity_smc.pine  TradingView version (v2: volume statistics, stop loss / take profit)
+pine/README.md         how every Pine calculation works
 test/                  engine and server tests (node --test)
 ```
 

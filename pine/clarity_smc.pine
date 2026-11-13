@@ -1,38 +1,122 @@
 // This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
-// Clarity SMC — the same rules as the Clarity SMC web chart, for TradingView.
-// Liquidity (BSL/SSL/LS), structure (BOS/MSS), order blocks, fair value gaps, volume bubbles
-// and confluence-only BUY / SELL SETUP labels. Signals are evaluated on closed bars only.
-// Setups highlight confluence — they are not trade advice and outcomes are never guaranteed.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Clarity SMC v2 — ICT structure + measured volume analysis + risk management (Pine Script v6)
+//
+// Keeps every v1 feature (liquidity BSL/SSL/LS, BOS/MSS, order blocks, fair value gaps, volume
+// bubbles, confluence setups, dashboard, alerts) and adds:
+//   • statistical volume analysis (relative volume, standard-deviation spikes, time-of-day baseline,
+//     bullish vs bearish candle volume, money flow, accumulation/distribution-like patterns,
+//     climax and fading-volume exhaustion)
+//   • volume-proportional bubbles coloured by candle direction, yellow for extreme spikes, with values
+//   • volume confirmation of ICT events and a measurable confirmation count for every setup
+//   • automatic stop loss, three take-profit levels (risk-to-reward or ICT liquidity targets),
+//     trade lines, trade tracking and a full trade dashboard
+//
+// Data integrity:
+//   • Only the chart's own `volume` series is used. Nothing is generated, estimated or smoothed into
+//     fake values. On Forex/CFD feeds (e.g. most XAUUSD symbols) `volume` is TICK volume — the number
+//     of price updates — not traded contracts. Use it for relative comparisons only.
+//   • Candle volume cannot reveal who traded or why. "Accumulation-like", "exhaustion" and similar
+//     words are interpretations of measured numbers, not detections of institutional orders.
+//   • Final signals are evaluated on CLOSED candles only. While a candle is still open, a setup is
+//     shown as PROVISIONAL and may disappear. No future data is used (no lookahead, no negative offsets).
+//   • Setups highlight measurable confluence. They are not financial advice; outcomes are never guaranteed.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
 
 //@version=6
-indicator("Clarity SMC — Liquidity · Structure · Confluence", "Clarity SMC", overlay = true,
-     max_boxes_count = 60, max_lines_count = 120, max_labels_count = 200, max_bars_back = 500)
+indicator("Clarity SMC — ICT + Volume Analysis", "Clarity SMC", overlay = true,
+     max_boxes_count = 100, max_lines_count = 200, max_labels_count = 500, max_bars_back = 500)
 
-// ───────────────────────── Inputs ─────────────────────────
-grpD = "Display"
-showBubbles = input.bool(true, "Volume Bubbles", group = grpD)
-showLiq     = input.bool(true, "Liquidity (BSL · SSL · LS)", group = grpD)
-showStruct  = input.bool(true, "BOS / MSS", group = grpD)
-showOB      = input.bool(true, "Order Blocks", group = grpD)
-showFVG     = input.bool(true, "Fair Value Gaps", group = grpD)
-showDash    = input.bool(true, "Dashboard", group = grpD)
-showSetups  = input.bool(true, "Buy / Sell Setup Labels", group = grpD)
+// ═════════════════════════════════════════ Inputs ═════════════════════════════════════════
+G1 = "1 · Display"
+showBubbles = input.bool(true, "Volume bubbles", group = G1, display = display.none)
+showLiq     = input.bool(true, "Liquidity (BSL · SSL · LS)", group = G1, display = display.none)
+showStruct  = input.bool(true, "BOS / MSS", group = G1, display = display.none)
+showOB      = input.bool(true, "Order blocks", group = G1, display = display.none)
+showFVG     = input.bool(true, "Fair value gaps", group = G1, display = display.none)
+showSetups  = input.bool(true, "Buy / sell setup labels", group = G1, display = display.none)
+showTrades  = input.bool(true, "Entry, stop loss and take profit lines", group = G1, display = display.none)
+showExh     = input.bool(true, "Volume exhaustion markers", group = G1, display = display.none)
+showDash    = input.bool(true, "Dashboard", group = G1, display = display.none)
 
-grpC = "Setup confirmations (BUY / SELL appear only when one lines up)"
-cSweepHv    = input.bool(true, "Liquidity Sweep + High Volume", group = grpC)
-cMssFvg     = input.bool(true, "MSS + Fair Value Gap", group = grpC)
-cBosOb      = input.bool(true, "BOS + Order Block retest", group = grpC)
-cSweepMssHv = input.bool(true, "Liquidity Sweep + MSS + Volume Spike", group = grpC)
+G2 = "2 · Volume analysis"
+volLen      = input.int(20, "Volume average period", minval = 5, maxval = 200, group = G2, display = display.none,
+     tooltip = "Number of previous candles used for the rolling average and standard deviation of volume. The current candle is excluded so a spike cannot raise its own baseline.")
+baseMode    = input.string("Same time of day", "Relative volume baseline", options = ["Same time of day", "Rolling bars"], group = G2, display = display.none,
+     tooltip = "Same time of day compares each candle with the candles at the same clock time on previous sessions, which removes the Asia / London / New York rhythm of XAUUSD. It needs at least 3 sessions of history for that time slot and uses the rolling average until then. Rolling bars always uses the previous candles.")
+todDays     = input.int(10, "Sessions for time-of-day baseline", minval = 3, maxval = 30, group = G2, display = display.none)
+rvolThresh  = input.float(1.5, "Relative volume threshold", minval = 1.0, maxval = 10.0, step = 0.1, group = G2, display = display.none,
+     tooltip = "Relative volume = candle volume / baseline average. At or above this value volume is at least Elevated. A statistical spike also needs this level, so a tiny standard deviation cannot create a spike on its own.")
+stdMult     = input.float(2.0, "Standard deviation multiplier (spike)", minval = 0.5, maxval = 10.0, step = 0.1, group = G2, display = display.none,
+     tooltip = "Z-score = (log of relative volume − its average over the previous candles) / its standard deviation. Logs are used because volume is strongly right-skewed. A candle is a High-volume spike when its z-score reaches this multiplier and its relative volume reaches the threshold above.")
+extremeMult = input.float(3.0, "Standard deviation multiplier (extreme)", minval = 1.0, maxval = 15.0, step = 0.1, group = G2, display = display.none)
+lowRvol     = input.float(0.6, "Low volume threshold (relative volume)", minval = 0.1, maxval = 1.0, step = 0.05, group = G2, display = display.none)
+fastLen     = input.int(5, "Short volume average (participation)", minval = 2, maxval = 50, group = G2, display = display.none)
+flowLen     = input.int(20, "Volume flow period", minval = 5, maxval = 200, group = G2, display = display.none,
+     tooltip = "Window for bullish vs bearish candle volume and for money flow (sum of close-location × volume / sum of volume).")
+cmfThresh   = input.float(0.05, "Money flow threshold", minval = 0.0, maxval = 0.5, step = 0.01, group = G2, display = display.none)
+exLen       = input.int(10, "Exhaustion lookback (bars)", minval = 3, maxval = 100, group = G2, display = display.none)
+exAtr       = input.float(3.0, "Exhaustion: minimum prior move (ATR)", minval = 0.5, maxval = 20.0, step = 0.5, group = G2, display = display.none)
+volTypeIn   = input.string("Auto-detect", "Volume data type", options = ["Auto-detect", "Exchange volume", "Tick volume"], group = G2, display = display.none,
+     tooltip = "Auto-detect treats Forex and CFD symbols (most XAUUSD feeds) as tick volume. Futures such as COMEX gold report exchange volume.")
 
-grpS = "Sensitivity"
-swingLen = input.int(5, "Swing length", minval = 2, maxval = 30, group = grpS)
-hvMult   = input.float(2.0, "High-volume threshold (× average)", minval = 1.1, maxval = 10, step = 0.1, group = grpS)
-maxZones = input.int(2, "Zones / levels per side", minval = 1, maxval = 5, group = grpS)
-dashPos  = input.string("Top Right", "Dashboard position", options = ["Top Right", "Bottom Right", "Top Left", "Bottom Left"], group = grpS)
+G3 = "3 · Volume bubbles"
+bubbleMin     = input.float(1.5, "Minimum relative volume for a bubble", minval = 0.0, maxval = 10.0, step = 0.1, group = G3, display = display.none,
+     tooltip = "Set to 0 to draw a bubble on every candle. Bubble size grows with relative volume.")
+bubbleScale   = input.float(1.0, "Bubble scaling", minval = 0.25, maxval = 3.0, step = 0.25, group = G3, display = display.none)
+bubbleMax     = input.string("Huge", "Largest bubble size", options = ["Normal", "Large", "Huge"], group = G3, display = display.none)
+bubblePlace   = input.string("Candle center", "Bubble placement", options = ["Candle center", "Beside candle"], group = G3, display = display.none)
+bubbleGap     = input.int(1, "Minimum bars between bubbles", minval = 0, maxval = 10, group = G3, display = display.none,
+     tooltip = "A bubble within this many bars of the previous one is skipped unless it is larger or an extreme spike. Reduces overlap.")
+bubbleText    = input.string("Relative volume", "Bubble value", options = ["Relative volume", "Volume", "Both", "None"], group = G3, display = display.none)
+bubbleTextMin = input.string("High", "Show values from strength", options = ["Elevated", "High", "Extreme"], group = G3, display = display.none)
+bubbleTransp  = input.int(65, "Bubble transparency", minval = 0, maxval = 95, group = G3, display = display.none)
+colBubBull    = input.color(#22C55E, "Bullish candle bubble", group = G3, display = display.none)
+colBubBear    = input.color(#EF4444, "Bearish candle bubble", group = G3, display = display.none)
+colBubExt     = input.color(#FACC15, "Extreme spike bubble", group = G3, display = display.none)
 
-// ───────────────────────── Constants ─────────────────────────
-int   VOL_LEN           = 20
-float LV_MULT           = 0.6
+G4 = "4 · Setup confirmations"
+cSweepHv    = input.bool(true, "Liquidity Sweep + High Volume", group = G4, display = display.none)
+cMssFvg     = input.bool(true, "MSS + Fair Value Gap", group = G4, display = display.none)
+cBosOb      = input.bool(true, "BOS + Order Block retest", group = G4, display = display.none)
+cSweepMssHv = input.bool(true, "Liquidity Sweep + MSS + Volume Spike", group = G4, display = display.none)
+minConf     = input.int(2, "Required checks (of 4)", minval = 0, maxval = 4, group = G4, display = display.none,
+     tooltip = "After an ICT trigger, these measurable checks are counted: 1) a volume spike on the trigger or the 2 candles before it, 2) volume flow agrees (money flow or bullish/bearish candle volume share), 3) participation rising (short volume average above the long average), 4) market structure agrees. A setup is confirmed only when at least this many pass.")
+
+G5 = "5 · Stop loss and take profit"
+bufMode    = input.string("ATR multiple", "Stop loss buffer type", options = ["ATR multiple", "Price units", "Ticks"], group = G5, display = display.none)
+bufAtr     = input.float(0.15, "Buffer (ATR multiple)", minval = 0.0, maxval = 5.0, step = 0.05, group = G5, display = display.none)
+bufPrice   = input.float(0.50, "Buffer (price units)", minval = 0.0, step = 0.1, group = G5, display = display.none)
+bufTicks   = input.int(20, "Buffer (ticks)", minval = 0, group = G5, display = display.none)
+spreadAdd  = input.float(0.0, "Extra spread allowance (price units)", minval = 0.0, step = 0.05, group = G5, display = display.none,
+     tooltip = "Added to the stop buffer. For XAUUSD, 0.2–0.5 covers a typical spread.")
+minRiskAtr = input.float(0.3, "Minimum stop distance (ATR)", minval = 0.05, maxval = 5.0, step = 0.05, group = G5, display = display.none)
+maxRiskAtr = input.float(3.0, "Maximum stop distance (ATR, 0 = off)", minval = 0.0, maxval = 20.0, step = 0.25, group = G5, display = display.none,
+     tooltip = "A trigger whose stop would be wider than this is rejected and listed as rejected in the detailed dashboard.")
+tpMode     = input.string("Risk-to-reward multiples", "Take profit method", options = ["Risk-to-reward multiples", "ICT liquidity targets"], group = G5, display = display.none,
+     tooltip = "ICT liquidity targets use untaken swing highs (buy-side liquidity) for buys and swing lows (sell-side liquidity) for sells, merging equal highs / lows into one pool. Missing targets fall back to the risk-to-reward multiples.")
+rr1        = input.float(1.0, "Take profit 1 (risk multiple)", minval = 0.25, maxval = 20.0, step = 0.25, group = G5, display = display.none)
+rr2        = input.float(2.0, "Take profit 2 (risk multiple)", minval = 0.25, maxval = 20.0, step = 0.25, group = G5, display = display.none)
+rr3        = input.float(3.0, "Take profit 3 (risk multiple)", minval = 0.25, maxval = 20.0, step = 0.25, group = G5, display = display.none)
+minTargetR = input.float(1.0, "ICT targets: minimum distance (risk multiple)", minval = 0.25, maxval = 10.0, step = 0.25, group = G5, display = display.none)
+eqTolAtr   = input.float(0.1, "Equal highs / lows tolerance (ATR)", minval = 0.01, maxval = 1.0, step = 0.01, group = G5, display = display.none)
+keepTrades = input.int(1, "Trade setups kept on chart", minval = 1, maxval = 3, group = G5, display = display.none)
+tradeMax   = input.int(120, "Trade tracking limit (bars)", minval = 10, maxval = 2000, group = G5, display = display.none)
+lblOffset  = input.int(4, "Trade label offset (bars right of price)", minval = 1, maxval = 50, group = G5, display = display.none)
+lblStagger = input.int(14, "Trade label stagger (bars)", minval = 0, maxval = 60, group = G5, display = display.none,
+     tooltip = "Neighbouring trade labels alternate between two columns so labels for close prices do not overlap.")
+
+G6 = "6 · Structure and zones"
+swingLen = input.int(5, "Swing detection length", minval = 2, maxval = 30, group = G6, display = display.none,
+     tooltip = "A swing high/low needs this many candles on each side. It is confirmed only after those right-side candles close, so swings never repaint.")
+maxZones = input.int(2, "Zones / levels per side", minval = 1, maxval = 5, group = G6, display = display.none)
+
+G7 = "7 · Dashboard"
+dashMode = input.string("Standard", "Dashboard detail", options = ["Standard", "Detailed"], group = G7, display = display.none)
+dashPos  = input.string("Top Right", "Dashboard position", options = ["Top Right", "Bottom Right", "Top Left", "Bottom Left"], group = G7, display = display.none)
+dashSize = input.string("Small", "Dashboard text size", options = ["Tiny", "Small", "Normal"], group = G7, display = display.none)
+
+// ═════════════════════════════════════════ Constants ═════════════════════════════════════════
 int   EMA_LEN           = 50
 float FVG_MIN_ATR       = 0.2
 float SETUP_FVG_MIN_ATR = 0.35
@@ -48,10 +132,12 @@ int   MAX_TRACKED       = 12
 int   MAX_STRUCT        = 6
 int   MAX_SWEEPS        = 5
 int   MAX_SETUPS        = 6
+int   MAX_BUB_LABELS    = 40
 int   EXTEND            = 8
+int   TOD_MIN_SESSIONS  = 3
 
-// Colour system: green bullish, red bearish, blue liquidity, yellow volume,
-// purple order blocks, light blue / light red fair value gaps.
+// Colour system: green bullish, red bearish, blue liquidity, yellow volume extremes,
+// purple order blocks, light blue / light red fair value gaps, green shades for take profits.
 color C_BULL     = #22C55E
 color C_BEAR     = #EF4444
 color C_LIQ      = #3B82F6
@@ -60,9 +146,14 @@ color C_OB       = #A855F7
 color C_FVG_BULL = #7DD3FC
 color C_FVG_BEAR = #F87171
 color C_NEUTRAL  = #94A3B8
+color C_SL       = #EF4444
+color C_TP1      = #86EFAC
+color C_TP2      = #22C55E
+color C_TP3      = #15803D
+color C_EXH      = #F59E0B
 color C_CLEAR    = color.new(color.white, 100)
 
-// ───────────────────────── Types ─────────────────────────
+// ═════════════════════════════════════════ Types ═════════════════════════════════════════
 type Liq
     float price
     int   idx
@@ -75,6 +166,7 @@ type Zone
     float  top
     float  bottom
     string origin
+    bool   hv         = false
     int    tapped     = na
     bool   retestDone = false
 
@@ -84,6 +176,7 @@ type Gap
     int   created
     float top
     float bottom
+    bool  hv = false
 
 type DirMem
     int   sweepIdx     = na
@@ -97,15 +190,176 @@ type DirMem
     int   setupIdx     = na
     int   setupGrade   = 0
 
-// ───────────────────────── Core series ─────────────────────────
-bool  conf   = barstate.isconfirmed
-float atr    = ta.atr(14)
-float ema50  = ta.ema(close, EMA_LEN)
-float vAvg   = ta.sma(nz(volume), VOL_LEN)[1]
-bool  hasVol = ta.cum(nz(volume) > 0 ? 1 : 0) > bar_index * 0.5
-float vRatio = hasVol and vAvg > 0 ? nz(volume) / vAvg : na
-bool  isHV   = not na(vRatio) and vRatio >= hvMult
+type Trade
+    int    dir
+    int    startIdx
+    float  entry
+    float  sl
+    float  tp1
+    float  tp2
+    float  tp3
+    string tp1Name
+    string tp2Name
+    string tp3Name
+    string reasons
+    string slBasis
+    int    checks
+    int    reached = 0
+    int    status  = 0
+    int    endIdx  = na
+    line   lnEntry
+    line   lnSl
+    line   lnTp1
+    line   lnTp2
+    line   lnTp3
+    label  lbEntry
+    label  lbSl
+    label  lbTp1
+    label  lbTp2
+    label  lbTp3
+    label  lbDone
 
+// ═════════════════════════════════════════ Formatting helpers ═════════════════════════════════════════
+fmtPrice(float p) =>
+    na(p) ? "—" : str.tostring(p, format.mintick)
+
+fmtNum(float x, string f) =>
+    na(x) ? "n/a" : str.tostring(x, f)
+
+fmtVol(float v) =>
+    na(v) ? "n/a" : str.tostring(v, format.volume)
+
+agoText(int bars) =>
+    bars == 0 ? "this candle" : bars == 1 ? "1 candle ago" : str.tostring(bars) + " candles ago"
+
+// ═════════════════════════════════════════ Core series ═════════════════════════════════════════
+bool  conf  = barstate.isconfirmed
+float atr   = ta.atr(14)
+float ema50 = ta.ema(close, EMA_LEN)
+float recentLow  = ta.lowest(low, swingLen * 2)
+float recentHigh = ta.highest(high, swingLen * 2)
+
+// ─── 1. Measured volume (never invented) ───
+// `volume` is the feed's own value. Missing values count as 0 and are reported, not filled in.
+float vol     = nz(volume)
+bool  volOk   = ta.cum(vol > 0 ? 1 : 0) > bar_index * 0.5
+bool  isTick  = volTypeIn == "Tick volume" or (volTypeIn == "Auto-detect" and (syminfo.type == "forex" or syminfo.type == "cfd"))
+string volUnit = isTick ? "tick volume" : "volume"
+
+// Rolling baseline: previous `volLen` candles ([1] excludes the current candle).
+float rollMean = ta.sma(vol, volLen)[1]
+
+// Time-of-day baseline: same clock slot on previous sessions (ring buffer per slot).
+int  tfSec       = timeframe.in_seconds(timeframe.period)
+bool todCapable  = timeframe.isintraday and tfSec > 0 and tfSec <= 3600 and 86400 % tfSec == 0
+int  slotsPerDay = todCapable ? int(86400 / tfSec) : 1
+bool useTod      = todCapable and baseMode == "Same time of day"
+var array<float> todVals = array.new<float>(slotsPerDay * todDays, 0.0)
+var array<int>   todPos  = array.new<int>(slotsPerDay, 0)
+var array<int>   todCnt  = array.new<int>(slotsPerDay, 0)
+int slot = todCapable ? math.min(math.floor((time % 86400000) / (tfSec * 1000.0)), slotsPerDay - 1) : 0
+
+float todMean = na
+int   todN    = 0
+if useTod
+    int n = todCnt.get(slot)
+    if n > 0
+        float s = 0.0
+        for k = 0 to n - 1
+            s += todVals.get(slot * todDays + k)
+        todMean := s / n
+        todN    := n
+// Store the closed candle's volume AFTER its own baseline was computed (no self-inclusion).
+if useTod and conf
+    int p = todPos.get(slot)
+    todVals.set(slot * todDays + p, vol)
+    todPos.set(slot, (p + 1) % todDays)
+    todCnt.set(slot, math.min(todCnt.get(slot) + 1, todDays))
+
+bool   todReady = useTod and todN >= TOD_MIN_SESSIONS
+float  baseMean = todReady ? todMean : rollMean
+string baseDesc = todReady ? "same time of day, " + str.tostring(todN) + " sessions" : str.tostring(volLen) + "-candle average"
+
+// Relative volume = candle volume / baseline average.
+float rvol = volOk and baseMean > 0 ? vol / baseMean : na
+
+// Statistical spike test. Volume is strongly right-skewed (roughly log-normal), so a z-score on raw
+// volume flags far too many candles. The z-score is therefore measured on log(relative volume)
+// against its own mean and standard deviation over the previous `volLen` candles. Tested on gold
+// futures 1m–1h data: about 3–4% of candles score High and 1–2% Extreme with the default inputs.
+// Zero-volume candles are clamped to 0.05× so the logarithm stays defined.
+float lnRv   = na(rvol) ? 0.0 : math.log(math.max(rvol, 0.05))
+float lnMean = ta.sma(lnRv, volLen)[1]
+float lnStd  = ta.stdev(lnRv, volLen)[1]
+float zScore = volOk and not na(rvol) and bar_index >= volLen * 2 and lnStd > 0 ? (lnRv - lnMean) / lnStd : na
+
+// Classification (thresholds are inputs; see tooltips).
+bool isSpike    = not na(zScore) and not na(rvol) and zScore >= stdMult and rvol >= rvolThresh
+bool isExtreme  = isSpike and zScore >= extremeMult
+bool isElevated = not isSpike and not na(rvol) and rvol >= rvolThresh
+bool isLowVol   = not na(rvol) and rvol <= lowRvol
+string volStrength = not volOk ? "No volume data" : na(rvol) ? "Collecting history" : isExtreme ? "Extreme" : isSpike ? "High" : isElevated ? "Elevated" : isLowVol ? "Low" : "Normal"
+
+// Volume change across several candles.
+float volFast        = ta.sma(vol, fastLen)
+float volSlow        = ta.sma(vol, volLen)
+bool  volExpanding   = volOk and volFast > volSlow * 1.1 and volFast > volFast[3]
+bool  volContracting = volOk and volFast < volSlow * 0.9 and volFast < volFast[3]
+
+// Bullish vs bearish candle volume (candle direction, NOT order-flow delta).
+int   candleDir = close > open ? 1 : close < open ? -1 : close > close[1] ? 1 : close < close[1] ? -1 : 0
+float upVol     = candleDir > 0 ? vol : 0.0
+float dnVol     = candleDir < 0 ? vol : 0.0
+float upSum     = math.sum(upVol, flowLen)
+float dnSum     = math.sum(dnVol, flowLen)
+float bullShare = upSum + dnSum > 0 ? upSum / (upSum + dnSum) : na
+
+// Money flow: close location value (−1 at the low … +1 at the high) weighted by volume.
+float clv    = high > low ? ((close - low) - (high - close)) / (high - low) : 0.0
+float volSum = math.sum(vol, flowLen)
+float cmf    = volSum > 0 ? math.sum(clv * vol, flowLen) / volSum : na
+bool  flowBull = not na(cmf) and cmf >= cmfThresh
+bool  flowBear = not na(cmf) and cmf <= -cmfThresh
+
+// Accumulation / distribution-LIKE patterns (interpretation of the numbers above).
+float netMove  = atr > 0 ? (close - close[flowLen]) / atr : na
+bool  sideways = not na(netMove) and math.abs(netMove) <= 1.5
+string volPattern = not volOk ? "Unavailable (no volume data)" :
+     flowBull and sideways ? "Accumulation-like (flat price, positive money flow)" :
+     flowBear and sideways ? "Distribution-like (flat price, negative money flow)" :
+     flowBull and netMove > 1.5 ? "Buying pressure with rising price" :
+     flowBear and netMove < -1.5 ? "Selling pressure with falling price" :
+     flowBull and netMove < -1.5 ? "Divergence: falling price, positive money flow" :
+     flowBear and netMove > 1.5 ? "Divergence: rising price, negative money flow" : "Balanced"
+
+// Exhaustion: (a) climax — spike at the end of an extended move with rejection,
+//             (b) fading — new high/low made on shrinking volume.
+float hhEx      = ta.highest(high, exLen)
+float llEx      = ta.lowest(low, exLen)
+float hhPrev    = ta.highest(high, exLen)[1]
+float llPrev    = ta.lowest(low, exLen)[1]
+float barRange  = high - low
+float upperWick = high - math.max(open, close)
+float lowerWick = math.min(open, close) - low
+bool climaxTop    = isSpike and atr > 0 and barRange > 0 and high >= hhEx and high - llEx >= exAtr * atr and (upperWick >= 0.4 * barRange or close < hl2)
+bool climaxBottom = isSpike and atr > 0 and barRange > 0 and low <= llEx and hhEx - low >= exAtr * atr and (lowerWick >= 0.4 * barRange or close > hl2)
+bool fadeTop      = volOk and not climaxTop and high > hhPrev and volContracting and not na(rvol) and rvol < 1.0
+bool fadeBottom   = volOk and not climaxBottom and low < llPrev and volContracting and not na(rvol) and rvol < 1.0
+float move3       = atr > 0 ? (close - close[3]) / atr : 0.0
+bool strongUp     = move3 >= 1.5 and volExpanding
+bool strongDn     = move3 <= -1.5 and volExpanding
+
+// Confirmation checks shared by both directions.
+bool chkSpike  = isSpike or isSpike[1] or isSpike[2]
+bool chkPart   = volOk and volFast > volSlow
+bool chkFlowUp = flowBull or (not na(bullShare) and bullShare >= 0.55)
+bool chkFlowDn = flowBear or (not na(bullShare) and bullShare <= 0.45)
+
+string volTip = "MEASURED\n" + volUnit + ": " + fmtVol(vol) + "\nbaseline (" + baseDesc + "): " + fmtVol(baseMean) +
+     "\nrelative volume: " + fmtNum(rvol, "#.##") + "×\nz-score (log scale): " + fmtNum(zScore, "#.#") +
+     "\ncandle: " + (candleDir > 0 ? "bullish" : candleDir < 0 ? "bearish" : "neutral") + "\nstrength: " + volStrength
+
+// ═════════════════════════════════════════ Swings ═════════════════════════════════════════
 pivotHigh(int len) =>
     bool ok = bar_index >= 2 * len
     if ok
@@ -129,45 +383,53 @@ pivotLow(int len) =>
 bool ph = pivotHigh(swingLen)
 bool pl = pivotLow(swingLen)
 
-hvSince(int fromIdx) =>
+spikeSince(int fromIdx) =>
     bool found = false
     int n = math.min(bar_index - fromIdx, 60)
     if n >= 0
         for k = 0 to n
-            if isHV[k]
+            if isSpike[k]
                 found := true
                 break
     found
 
-// ───────────────────────── State ─────────────────────────
-var array<Liq>  liqs = array.new<Liq>()
-var array<Zone> obs  = array.new<Zone>()
-var array<Gap>  gaps = array.new<Gap>()
+// ═════════════════════════════════════════ State ═════════════════════════════════════════
+var array<Liq>   liqs   = array.new<Liq>()
+var array<Zone>  obs    = array.new<Zone>()
+var array<Gap>   gaps   = array.new<Gap>()
+var array<Trade> trades = array.new<Trade>()
 var DirMem memUp = DirMem.new()
 var DirMem memDn = DirMem.new()
 
-var int   trend    = 0
-var float shPrice  = na
-var int   shIdx    = na
-var bool  shBroken = true
-var float slPrice  = na
-var int   slIdx    = na
-var bool  slBroken = true
+var int   trend     = 0
+var float swHiPrice = na
+var int   swHiIdx   = na
+var bool  swHiBroken = true
+var float swLoPrice = na
+var int   swLoIdx   = na
+var bool  swLoBroken = true
 
-var string lastStructKind = ""
-var int    lastStructDir  = 0
-var int    lastStructBar  = na
-var int    lastSweepDir   = 0
-var int    lastSweepBar   = na
-var int    lastSetupDir   = 0
-var int    lastSetupBar   = na
+var string lastStructKind  = ""
+var int    lastStructDir   = 0
+var int    lastStructBar   = na
+var bool   lastStructHv    = false
+var int    lastSweepDir    = 0
+var int    lastSweepBar    = na
+var int    lastSetupDir    = 0
+var int    lastSetupBar    = na
+var string lastVolEvent    = "None yet"
+var int    lastVolEventBar = na
+var string lastReject      = "None"
+var int    lastRejectBar   = na
 
 var array<line>  structLines  = array.new<line>()
 var array<label> structLabels = array.new<label>()
 var array<label> sweepLabels  = array.new<label>()
 var array<label> setupLabels  = array.new<label>()
 var array<int>   setupDirs    = array.new<int>()
+var array<label> bubbleLabels = array.new<label>()
 
+// ═════════════════════════════════════════ Engine helpers ═════════════════════════════════════════
 trimSide(array<Liq> arr, int dir, int maxN) =>
     int cnt = 0
     for lv in arr
@@ -181,7 +443,7 @@ trimSide(array<Liq> arr, int dir, int maxN) =>
 
 makeOB(array<Zone> zones, int dir, int fromIdx, string origin, float atrNow) =>
     // Origin of the impulse leg: extreme candle between the broken swing and the break.
-    int span = math.min(bar_index - fromIdx, 300)
+    int span = math.max(1, math.min(bar_index - fromIdx, 300))
     int km = 0
     for k = 0 to span - 1
         if dir > 0 ? low[k] < low[km] : high[k] > high[km]
@@ -200,17 +462,23 @@ makeOB(array<Zone> zones, int dir, int fromIdx, string origin, float atrNow) =>
             top := math.max(open[kob], close[kob])
         else
             bot := math.min(open[kob], close[kob])
+    // Volume-backed block: a statistical spike somewhere in the leg from the block to the break.
+    bool legHv = false
+    for k = 0 to kob
+        if isSpike[k]
+            legHv := true
+            break
     if top > bot and top - bot <= 3 * atrNow
         if zones.size() > 0
             for j = zones.size() - 1 to 0
                 Zone z = zones.get(j)
                 if z.dir == dir and z.bottom <= top and z.top >= bot
                     zones.remove(j)
-        zones.push(Zone.new(dir, bar_index - kob, bar_index, top, bot, origin))
+        zones.push(Zone.new(dir, bar_index - kob, bar_index, top, bot, origin, legHv))
         if zones.size() > MAX_TRACKED * 2
             zones.shift()
 
-addGap(array<Gap> arr, int dir, float bot, float top) =>
+addGap(array<Gap> arr, int dir, float bot, float top, bool hv) =>
     bool merged = false
     if arr.size() > 0
         for j = arr.size() - 1 to 0
@@ -219,10 +487,11 @@ addGap(array<Gap> arr, int dir, float bot, float top) =>
                 g.top := math.max(g.top, top)
                 g.bottom := math.min(g.bottom, bot)
                 g.created := bar_index
+                g.hv := g.hv or hv
                 merged := true
                 break
     if not merged
-        arr.push(Gap.new(dir, bar_index - 1, bar_index, top, bot))
+        arr.push(Gap.new(dir, bar_index - 1, bar_index, top, bot, hv))
         if arr.size() > MAX_TRACKED * 2
             arr.shift()
 
@@ -242,57 +511,297 @@ reasonText(bool ls, bool mss, bool bos, bool ob, bool fvg, bool hv) =>
         parts.push("HV")
     parts.join(" · ")
 
-evalSetup(DirMem m, bool obRetest, bool mssNow, bool ok) =>
-    bool rLS = false
+reasonWords(bool ls, bool mss, bool bos, bool ob, bool fvg, bool hv) =>
+    array<string> parts = array.new<string>()
+    if ls
+        parts.push("Liquidity Sweep")
+    if mss
+        parts.push("Market Structure Shift")
+    if bos
+        parts.push("Break of Structure")
+    if ob
+        parts.push("Order Block retest")
+    if fvg
+        parts.push("Fair Value Gap")
+    if hv
+        parts.push("High Volume")
+    parts.join(" + ")
+
+// ICT trigger: one of the enabled confluence patterns (same rules as v1, HV = statistical spike).
+evalSetup(DirMem m, bool obRetest, bool mssNow) =>
+    bool rLS  = false
     bool rMSS = false
     bool rBOS = false
-    bool rOB = false
+    bool rOB  = false
     bool rFVG = false
-    bool rHV = false
-    if ok
-        if cSweepHv and not na(m.sweepIdx) and not m.sweepUsedHv and m.sweepIdx == bar_index and m.sweepHv
-            m.sweepUsedHv := true
-            rLS := true
-            rHV := true
-        if cMssFvg and not na(m.mssIdx) and not m.mssUsedFvg and bar_index - m.mssIdx <= MSS_FVG_WIN and not na(m.fvgIdx) and m.fvgIdx >= m.mssIdx - MSS_FVG_WIN
-            m.mssUsedFvg := true
-            rMSS := true
-            rFVG := true
-        if cBosOb and obRetest
-            rBOS := true
-            rOB := true
-        if cSweepMssHv and mssNow and not na(m.sweepIdx) and not m.sweepUsedMss and bar_index - m.sweepIdx <= SWEEP_MSS_WIN and hvSince(m.sweepIdx - 1)
-            m.sweepUsedMss := true
-            rLS := true
-            rMSS := true
-            rHV := true
+    bool rHV  = false
+    if cSweepHv and not na(m.sweepIdx) and not m.sweepUsedHv and m.sweepIdx == bar_index and m.sweepHv
+        m.sweepUsedHv := true
+        rLS := true
+        rHV := true
+    if cMssFvg and not na(m.mssIdx) and not m.mssUsedFvg and bar_index - m.mssIdx <= MSS_FVG_WIN and not na(m.fvgIdx) and m.fvgIdx >= m.mssIdx - MSS_FVG_WIN
+        m.mssUsedFvg := true
+        rMSS := true
+        rFVG := true
+    if cBosOb and obRetest
+        rBOS := true
+        rOB := true
+    if cSweepMssHv and mssNow and not na(m.sweepIdx) and not m.sweepUsedMss and bar_index - m.sweepIdx <= SWEEP_MSS_WIN and spikeSince(m.sweepIdx - 1)
+        m.sweepUsedMss := true
+        rLS := true
+        rMSS := true
+        rHV := true
     int grade = (rLS ? 1 : 0) + (rMSS ? 1 : 0) + (rBOS ? 1 : 0) + (rOB ? 1 : 0) + (rFVG ? 1 : 0) + (rHV ? 1 : 0)
-    bool fire = grade > 0 and (na(m.setupIdx) or bar_index - m.setupIdx >= COOLDOWN or grade > m.setupGrade)
-    if fire
-        m.setupIdx := bar_index
-        m.setupGrade := grade
-    [fire, reasonText(rLS, rMSS, rBOS, rOB, rFVG, rHV), rLS]
+    bool trigger = grade > 0 and (na(m.setupIdx) or bar_index - m.setupIdx >= COOLDOWN or grade > m.setupGrade)
+    [trigger, rLS, rMSS, rBOS, rOB, rFVG, rHV, grade]
 
-drawStructure(string kind, int dir, int fromIdx, float price) =>
+// Stop loss: beyond the sweep extreme, the order block, or the last structural swing — plus buffer.
+stopFor(int dir, float entry, bool useSweep, int sweepIdx, bool useOb, float obLevel, float swingLevel, float fallback, float atrNow) =>
+    float anchor = na
+    string basis = ""
+    if useSweep and not na(sweepIdx)
+        int n = math.max(0, math.min(bar_index - sweepIdx, 50))
+        float ext = dir > 0 ? low : high
+        for k = 0 to n
+            ext := dir > 0 ? math.min(ext, low[k]) : math.max(ext, high[k])
+        anchor := ext
+        basis := dir > 0 ? "liquidity sweep low" : "liquidity sweep high"
+    else if useOb and not na(obLevel)
+        anchor := dir > 0 ? math.min(obLevel, low) : math.max(obLevel, high)
+        basis := dir > 0 ? "order block low" : "order block high"
+    else if not na(swingLevel) and (entry - swingLevel) * dir > 0
+        anchor := swingLevel
+        basis := dir > 0 ? "structural swing low" : "structural swing high"
+    if na(anchor) or (entry - anchor) * dir <= 0
+        anchor := fallback
+        basis := dir > 0 ? "recent " + str.tostring(swingLen * 2) + "-candle low" : "recent " + str.tostring(swingLen * 2) + "-candle high"
+    float buf = (bufMode == "ATR multiple" ? bufAtr * atrNow : bufMode == "Price units" ? bufPrice : bufTicks * syminfo.mintick) + spreadAdd
+    float sl = anchor - dir * buf
+    float minRisk = minRiskAtr * atrNow
+    if (entry - sl) * dir < minRisk
+        sl := entry - dir * minRisk
+        basis += " (widened to minimum distance)"
+    [sl, basis]
+
+// ICT targets: untaken liquidity in the trade direction, equal highs/lows merged into one pool.
+ictTargets(int dir, float entry, float risk, float atrNow) =>
+    array<float> cand = array.new<float>()
+    for lv in liqs
+        if lv.dir == dir and (lv.price - entry) * dir >= minTargetR * risk
+            cand.push(lv.price)
+    if dir > 0
+        cand.sort(order.ascending)
+    else
+        cand.sort(order.descending)
+    array<float> pools  = array.new<float>()
+    array<int>   counts = array.new<int>()
+    for p in cand
+        int last = pools.size() - 1
+        if last >= 0 and math.abs(p - pools.get(last)) <= eqTolAtr * atrNow
+            pools.set(last, dir > 0 ? math.max(p, pools.get(last)) : math.min(p, pools.get(last)))
+            counts.set(last, counts.get(last) + 1)
+        else
+            pools.push(p)
+            counts.push(1)
+    array<float>  tps   = array.new<float>()
+    array<string> names = array.new<string>()
+    int nPools = math.min(pools.size(), 3)
+    if nPools > 0
+        for k = 0 to nPools - 1
+            tps.push(pools.get(k))
+            string kind = counts.get(k) >= 2 ? (dir > 0 ? "equal highs" : "equal lows") : (dir > 0 ? "buy-side liquidity" : "sell-side liquidity")
+            names.push(kind + (counts.get(k) >= 2 ? " (" + str.tostring(counts.get(k)) + " swings)" : ""))
+    array<float> rrs = array.from(rr1, rr2, rr3)
+    int i = 0
+    while tps.size() < 3 and i < 3
+        float t = entry + dir * risk * rrs.get(i)
+        if tps.size() == 0 or (t - tps.get(tps.size() - 1)) * dir > 0
+            tps.push(t)
+            names.push("risk multiple " + str.tostring(rrs.get(i)) + " (no further liquidity pool)")
+        i += 1
+    while tps.size() < 3
+        tps.push(tps.get(tps.size() - 1) + dir * risk)
+        names.push("extension +1 risk multiple")
+    [tps.get(0), tps.get(1), tps.get(2), names.get(0), names.get(1), names.get(2)]
+
+// Complete trade plan for a trigger: stop, risk, three targets, and a rejection reason if any.
+buildPlan(int dir, float entry, bool useSweep, int sweepIdx, bool useOb, float obLevel, float swingLevel, float fallback, float atrNow) =>
+    [sl, basis] = stopFor(dir, entry, useSweep, sweepIdx, useOb, obLevel, swingLevel, fallback, atrNow)
+    float risk = (entry - sl) * dir
+    string reject = ""
+    if maxRiskAtr > 0 and atrNow > 0 and risk > maxRiskAtr * atrNow
+        reject := "stop distance " + str.tostring(risk / atrNow, "#.##") + " ATR is wider than the " + str.tostring(maxRiskAtr) + " ATR maximum"
+    float t1 = entry + dir * risk * rr1
+    float t2 = entry + dir * risk * rr2
+    float t3 = entry + dir * risk * rr3
+    string n1 = "risk multiple " + str.tostring(rr1)
+    string n2 = "risk multiple " + str.tostring(rr2)
+    string n3 = "risk multiple " + str.tostring(rr3)
+    if tpMode == "ICT liquidity targets"
+        [a1, a2, a3, b1, b2, b3] = ictTargets(dir, entry, risk, atrNow)
+        t1 := a1
+        t2 := a2
+        t3 := a3
+        n1 := b1
+        n2 := b2
+        n3 := b3
+    [sl, basis, risk, t1, t2, t3, n1, n2, n3, reject]
+
+drawStructure(string kind, int dir, int fromIdx, float price, bool hv) =>
     color col = dir > 0 ? C_BULL : C_BEAR
     line ln = line.new(fromIdx, price, bar_index, price, color = color.new(col, kind == "MSS" ? 0 : 25), style = line.style_dashed, width = 1)
-    label lb = label.new(math.round((fromIdx + bar_index) / 2.0), price, kind, style = dir > 0 ? label.style_label_down : label.style_label_up, color = C_CLEAR, textcolor = col, size = size.tiny)
+    string tip = (kind == "MSS" ? "Market Structure Shift" : "Break of Structure") + (dir > 0 ? " (bullish)" : " (bearish)") +
+         "\nclose beyond the swing at " + fmtPrice(price) + "\n" + volTip
+    label lb = label.new(math.round((fromIdx + bar_index) / 2.0), price, kind + (hv ? " · HV" : ""), style = dir > 0 ? label.style_label_down : label.style_label_up,
+         color = C_CLEAR, textcolor = col, size = size.tiny, tooltip = tip)
     structLines.push(ln)
     structLabels.push(lb)
     if structLines.size() > MAX_STRUCT
         line.delete(structLines.shift())
         label.delete(structLabels.shift())
 
-// ───────────────────────── Per-bar engine (closed bars only) ─────────────────────────
-bool obRetestUp = false
-bool obRetestDn = false
-bool sweepUpNow = false
-bool sweepDnNow = false
-bool mssUpNow   = false
-bool mssDnNow   = false
+// ═════════════════════════════════════════ Trade drawing ═════════════════════════════════════════
+rrText(float target, float entry, float risk, int dir) =>
+    risk > 0 ? "1:" + str.tostring((target - entry) * dir / risk, "#.#") : "n/a"
 
-// 1) Order block mitigation and retest confirmation
-if conf and obs.size() > 0
+deleteTrade(Trade t) =>
+    line.delete(t.lnEntry)
+    line.delete(t.lnSl)
+    line.delete(t.lnTp1)
+    line.delete(t.lnTp2)
+    line.delete(t.lnTp3)
+    label.delete(t.lbEntry)
+    label.delete(t.lbSl)
+    label.delete(t.lbTp1)
+    label.delete(t.lbTp2)
+    label.delete(t.lbTp3)
+    label.delete(t.lbDone)
+
+// Labels alternate between two columns in price order (SL, Entry, TP1, TP2, TP3) to avoid overlap.
+placeTrade(Trade t, int xA, int xB) =>
+    line.set_x2(t.lnSl, xA)
+    line.set_x2(t.lnEntry, xB)
+    line.set_x2(t.lnTp1, xA)
+    line.set_x2(t.lnTp2, xB)
+    line.set_x2(t.lnTp3, xA)
+    label.set_x(t.lbSl, xA)
+    label.set_x(t.lbEntry, xB)
+    label.set_x(t.lbTp1, xA)
+    label.set_x(t.lbTp2, xB)
+    label.set_x(t.lbTp3, xA)
+
+newTrade(int dir, float entry, float sl, float tp1, float tp2, float tp3, string n1, string n2, string n3, string reasons, string basis, int checks) =>
+    Trade t = Trade.new(dir, bar_index, entry, sl, tp1, tp2, tp3, n1, n2, n3, reasons, basis, checks)
+    if showTrades
+        float risk = (entry - sl) * dir
+        color ce = dir > 0 ? C_BULL : C_BEAR
+        int xA = bar_index + lblOffset
+        int xB = xA + lblStagger
+        t.lnEntry := line.new(bar_index, entry, xB, entry, color = ce, width = 2)
+        t.lnSl    := line.new(bar_index, sl, xA, sl, color = C_SL, style = line.style_dashed, width = 1)
+        t.lnTp1   := line.new(bar_index, tp1, xA, tp1, color = C_TP1, style = line.style_dotted, width = 1)
+        t.lnTp2   := line.new(bar_index, tp2, xB, tp2, color = C_TP2, style = line.style_dotted, width = 1)
+        t.lnTp3   := line.new(bar_index, tp3, xA, tp3, color = C_TP3, style = line.style_dotted, width = 1)
+        t.lbEntry := label.new(xB, entry, (dir > 0 ? "BUY entry " : "SELL entry ") + fmtPrice(entry), style = label.style_label_left,
+             color = ce, textcolor = color.white, size = size.tiny, tooltip = reasons)
+        t.lbSl    := label.new(xA, sl, "SL " + fmtPrice(sl) + " · −" + fmtPrice(risk), style = label.style_label_left,
+             color = C_SL, textcolor = color.white, size = size.tiny, tooltip = "Stop loss beyond the " + basis)
+        t.lbTp1   := label.new(xA, tp1, "TP1 " + fmtPrice(tp1) + " · " + rrText(tp1, entry, risk, dir), style = label.style_label_left,
+             color = C_TP1, textcolor = #052E16, size = size.tiny, tooltip = "Take profit 1: " + n1)
+        t.lbTp2   := label.new(xB, tp2, "TP2 " + fmtPrice(tp2) + " · " + rrText(tp2, entry, risk, dir), style = label.style_label_left,
+             color = C_TP2, textcolor = color.white, size = size.tiny, tooltip = "Take profit 2: " + n2)
+        t.lbTp3   := label.new(xA, tp3, "TP3 " + fmtPrice(tp3) + " · " + rrText(tp3, entry, risk, dir), style = label.style_label_left,
+             color = C_TP3, textcolor = color.white, size = size.tiny, tooltip = "Take profit 3: " + n3)
+    t
+
+// When a trade ends, lines stop at the exit candle, labels are removed and one small result tag remains.
+finishTrade(Trade t) =>
+    if showTrades
+        int x = t.endIdx
+        line.set_x2(t.lnEntry, x)
+        line.set_x2(t.lnSl, x)
+        line.set_x2(t.lnTp1, x)
+        line.set_x2(t.lnTp2, x)
+        line.set_x2(t.lnTp3, x)
+        line.set_color(t.lnEntry, color.new(t.dir > 0 ? C_BULL : C_BEAR, 55))
+        line.set_color(t.lnSl, color.new(C_SL, 60))
+        line.set_color(t.lnTp1, color.new(C_TP1, 60))
+        line.set_color(t.lnTp2, color.new(C_TP2, 60))
+        line.set_color(t.lnTp3, color.new(C_TP3, 60))
+        label.delete(t.lbEntry)
+        label.delete(t.lbSl)
+        label.delete(t.lbTp1)
+        label.delete(t.lbTp2)
+        label.delete(t.lbTp3)
+        string res = t.status == 1 ? "TP3 reached" : t.status == -1 ? (t.reached > 0 ? "Stopped after TP" + str.tostring(t.reached) : "Stopped out") :
+             t.status == -2 ? (t.reached > 0 ? "Expired · TP" + str.tostring(t.reached) + " reached" : "Expired") : "SL and TP in same candle"
+        float y = t.status == 1 ? t.tp3 : t.status == -1 or t.status == -3 ? t.sl : t.entry
+        t.lbDone := label.new(x, y, res, style = label.style_label_left, color = C_CLEAR,
+             textcolor = t.status == 1 ? C_TP2 : t.status == -2 ? C_NEUTRAL : C_SL, size = size.tiny)
+
+tradeStatusText(Trade t) =>
+    t.status == 1 ? "Take Profit 3 reached" :
+     t.status == -1 ? (t.reached > 0 ? "Stopped out after Take Profit " + str.tostring(t.reached) : "Stopped out") :
+     t.status == -2 ? "Expired after " + str.tostring(tradeMax) + " candles" + (t.reached > 0 ? " (Take Profit " + str.tostring(t.reached) + " reached)" : "") :
+     t.status == -3 ? "Stop and target touched in the same candle (order unknown)" :
+     t.reached > 0 ? "Active · Take Profit " + str.tostring(t.reached) + " reached" : "Active"
+
+// ═════════════════════════════════════════ 0) Trade tracking (closed candles only) ═════════════════════════════════════════
+// Runs before new setups so a new trade is never evaluated on its own entry candle.
+if conf and trades.size() > 0
+    for t in trades
+        if t.status == 0 and bar_index > t.startIdx
+            bool hitSl = t.dir > 0 ? low <= t.sl : high >= t.sl
+            int reach = t.reached
+            if (t.dir > 0 ? high >= t.tp3 : low <= t.tp3)
+                reach := 3
+            else if (t.dir > 0 ? high >= t.tp2 : low <= t.tp2)
+                reach := math.max(reach, 2)
+            else if (t.dir > 0 ? high >= t.tp1 : low <= t.tp1)
+                reach := math.max(reach, 1)
+            bool tpNow = reach > t.reached
+            if hitSl and tpNow
+                t.reached := reach
+                t.status := -3
+                t.endIdx := bar_index
+            else if hitSl
+                t.status := -1
+                t.endIdx := bar_index
+            else
+                t.reached := reach
+                if reach >= 3
+                    t.status := 1
+                    t.endIdx := bar_index
+                else if bar_index - t.startIdx >= tradeMax
+                    t.status := -2
+                    t.endIdx := bar_index
+            if t.status != 0
+                finishTrade(t)
+            else if showTrades
+                placeTrade(t, bar_index + lblOffset, bar_index + lblOffset + lblStagger)
+
+// ═════════════════════════════════════════ ICT engine (every candle) ═════════════════════════════════════════
+// The engine runs on every update. On an open real-time candle its results are provisional and
+// TradingView rolls them back on the next update; drawings and alerts below are created only when
+// the candle has closed (`conf`).
+bool  obRetestUp = false
+bool  obRetestDn = false
+float obStopUp   = na
+float obStopDn   = na
+bool  obHvTouchUp  = false
+bool  obHvTouchDn  = false
+bool  fvgHvTouchUp = false
+bool  fvgHvTouchDn = false
+bool  sweepUpNow = false
+bool  sweepDnNow = false
+bool  mssUpNow   = false
+bool  mssDnNow   = false
+bool  structUpNow = false
+bool  structDnNow = false
+bool  structHvNow = false
+
+// 1) Order block mitigation, volume at the block, and retest confirmation
+if obs.size() > 0
     for j = obs.size() - 1 to 0
         Zone z = obs.get(j)
         if bar_index > z.created
@@ -303,21 +812,38 @@ if conf and obs.size() > 0
                 bool touched = z.dir > 0 ? low <= z.top : high >= z.bottom
                 if touched and na(z.tapped)
                     z.tapped := bar_index
+                if touched and isSpike
+                    if z.dir > 0
+                        obHvTouchUp := true
+                    else
+                        obHvTouchDn := true
                 if not na(z.tapped) and not z.retestDone and bar_index - z.tapped <= 2
                     bool held = z.dir > 0 ? close > open and close > z.bottom : close < open and close < z.top
                     if held
                         z.retestDone := true
                         if z.origin == "BOS" and trend == z.dir and z.tapped - z.created >= 2 and z.tapped - z.created <= OB_RETEST_MAX
+                            // Stop anchor: beyond the block and every wick since the first tap.
+                            float wick = z.dir > 0 ? low : high
+                            for k = 0 to bar_index - z.tapped
+                                wick := z.dir > 0 ? math.min(wick, low[k]) : math.max(wick, high[k])
                             if z.dir > 0
                                 obRetestUp := true
+                                obStopUp := math.min(z.bottom, wick)
                             else
                                 obRetestDn := true
+                                obStopDn := math.max(z.top, wick)
 
 // 2) Fair value gap mitigation — gaps shrink as they fill and disappear once closed
-if conf and gaps.size() > 0
+if gaps.size() > 0
     for j = gaps.size() - 1 to 0
         Gap g = gaps.get(j)
         if bar_index > g.created
+            bool entered = g.dir > 0 ? low < g.top : high > g.bottom
+            if entered and isSpike
+                if g.dir > 0
+                    fvgHvTouchUp := true
+                else
+                    fvgHvTouchDn := true
             if bar_index - g.created > FVG_MAX_AGE
                 gaps.remove(j)
             else if g.dir > 0
@@ -332,10 +858,10 @@ if conf and gaps.size() > 0
                     g.bottom := high
 
 // 3) Liquidity: sweep (wick through, close back inside) or break (close through)
-if conf and liqs.size() > 0
-    float bestBsl = na
+if liqs.size() > 0
+    float bestBsl    = na
     int   bestBslIdx = na
-    float bestSsl = na
+    float bestSsl    = na
     int   bestSslIdx = na
     for j = liqs.size() - 1 to 0
         Liq lv = liqs.get(j)
@@ -357,7 +883,7 @@ if conf and liqs.size() > 0
     if not na(bestBsl) and bar_index - bestBslIdx >= MIN_SWEEP_AGE
         memDn.sweepIdx := bar_index
         memDn.sweepPrice := bestBsl
-        memDn.sweepHv := isHV or isHV[1]
+        memDn.sweepHv := isSpike or isSpike[1]
         memDn.sweepUsedHv := false
         memDn.sweepUsedMss := false
         sweepDnNow := true
@@ -366,7 +892,7 @@ if conf and liqs.size() > 0
     if not na(bestSsl) and bar_index - bestSslIdx >= MIN_SWEEP_AGE
         memUp.sweepIdx := bar_index
         memUp.sweepPrice := bestSsl
-        memUp.sweepHv := isHV or isHV[1]
+        memUp.sweepHv := isSpike or isSpike[1]
         memUp.sweepUsedHv := false
         memUp.sweepUsedMss := false
         sweepUpNow := true
@@ -374,71 +900,126 @@ if conf and liqs.size() > 0
         lastSweepBar := bar_index
 
 // 4) Market structure (close-based) + order blocks
-if conf and not shBroken and close > shPrice
+if not swHiBroken and close > swHiPrice
     string kind = trend == -1 ? "MSS" : "BOS"
-    shBroken := true
+    bool hv = isSpike or isSpike[1]
+    swHiBroken := true
     trend := 1
-    makeOB(obs, 1, shIdx, kind, atr)
+    makeOB(obs, 1, swHiIdx, kind, atr)
     lastStructKind := kind
     lastStructDir := 1
     lastStructBar := bar_index
+    lastStructHv := hv
+    structUpNow := true
+    structHvNow := hv
     if kind == "MSS"
         memUp.mssIdx := bar_index
         memUp.mssUsedFvg := false
         mssUpNow := true
-    if showStruct
-        drawStructure(kind, 1, shIdx, shPrice)
+    if conf and showStruct
+        drawStructure(kind, 1, swHiIdx, swHiPrice, hv)
 
-if conf and not slBroken and close < slPrice
+if not swLoBroken and close < swLoPrice
     string kind = trend == 1 ? "MSS" : "BOS"
-    slBroken := true
+    bool hv = isSpike or isSpike[1]
+    swLoBroken := true
     trend := -1
-    makeOB(obs, -1, slIdx, kind, atr)
+    makeOB(obs, -1, swLoIdx, kind, atr)
     lastStructKind := kind
     lastStructDir := -1
     lastStructBar := bar_index
+    lastStructHv := hv
+    structDnNow := true
+    structHvNow := hv
     if kind == "MSS"
         memDn.mssIdx := bar_index
         memDn.mssUsedFvg := false
         mssDnNow := true
-    if showStruct
-        drawStructure(kind, -1, slIdx, slPrice)
+    if conf and showStruct
+        drawStructure(kind, -1, swLoIdx, swLoPrice, hv)
 
-// 5) Swing confirmation -> liquidity levels
-if conf and ph
-    shPrice := high[swingLen]
-    shIdx := bar_index - swingLen
-    shBroken := false
-    liqs.push(Liq.new(shPrice, shIdx, 1))
+// 5) Swing confirmation -> liquidity levels (a swing is known only `swingLen` candles later)
+if ph
+    swHiPrice := high[swingLen]
+    swHiIdx := bar_index - swingLen
+    swHiBroken := false
+    liqs.push(Liq.new(swHiPrice, swHiIdx, 1))
     trimSide(liqs, 1, MAX_TRACKED)
-if conf and pl
-    slPrice := low[swingLen]
-    slIdx := bar_index - swingLen
-    slBroken := false
-    liqs.push(Liq.new(slPrice, slIdx, -1))
+if pl
+    swLoPrice := low[swingLen]
+    swLoIdx := bar_index - swingLen
+    swLoBroken := false
+    liqs.push(Liq.new(swLoPrice, swLoIdx, -1))
     trimSide(liqs, -1, MAX_TRACKED)
 
-// 6) Fair value gaps (candles 1-2-3)
-if conf and bar_index >= 2 and atr > 0
+// 6) Fair value gaps (candles 1-2-3); a gap is volume-backed when its displacement candle spiked
+bool fvgHvNew = false
+if bar_index >= 2 and atr > 0
     float minGap = FVG_MIN_ATR * atr
+    bool gapHv = isSpike or isSpike[1]
     if low > high[2] and low - high[2] >= minGap and close[1] > open[1]
         if low - high[2] >= SETUP_FVG_MIN_ATR * atr
             memUp.fvgIdx := bar_index
-        addGap(gaps, 1, high[2], low)
+        addGap(gaps, 1, high[2], low, gapHv)
+        fvgHvNew := fvgHvNew or gapHv
     if high < low[2] and low[2] - high >= minGap and close[1] < open[1]
         if low[2] - high >= SETUP_FVG_MIN_ATR * atr
             memDn.fvgIdx := bar_index
-        addGap(gaps, -1, high, low[2])
+        addGap(gaps, -1, high, low[2], gapHv)
+        fvgHvNew := fvgHvNew or gapHv
 
-// 7) Confluence setups
-[fireUp, txtUp, lsUp] = evalSetup(memUp, obRetestUp, mssUpNow, conf)
-[fireDn, txtDn, lsDn] = evalSetup(memDn, obRetestDn, mssDnNow, conf)
+// ═════════════════════════════════════════ 7) Setups: trigger → checks → risk plan ═════════════════════════════════════════
+[trigUp, lsU, mssU, bosU, obU, fvgU, hvU, gradeUp] = evalSetup(memUp, obRetestUp, mssUpNow)
+[trigDn, lsD, mssD, bosD, obD, fvgD, hvD, gradeDn] = evalSetup(memDn, obRetestDn, mssDnNow)
 
-addSetupLabel(int dir, string reasons) =>
+int checksUp = (chkSpike ? 1 : 0) + (chkFlowUp ? 1 : 0) + (chkPart ? 1 : 0) + (trend == 1 ? 1 : 0)
+int checksDn = (chkSpike ? 1 : 0) + (chkFlowDn ? 1 : 0) + (chkPart ? 1 : 0) + (trend == -1 ? 1 : 0)
+
+[slU, basisU, riskU, t1U, t2U, t3U, n1U, n2U, n3U, rejU] = buildPlan(1, close, lsU, memUp.sweepIdx, obU, obStopUp, swLoPrice, recentLow, atr)
+[slD, basisD, riskD, t1D, t2D, t3D, n1D, n2D, n3D, rejD] = buildPlan(-1, close, lsD, memDn.sweepIdx, obD, obStopDn, swHiPrice, recentHigh, atr)
+
+bool okUp = trigUp and checksUp >= minConf and rejU == ""
+bool okDn = trigDn and checksDn >= minConf and rejD == ""
+
+string wordsUp = reasonWords(lsU, mssU, bosU, obU, fvgU, hvU)
+string wordsDn = reasonWords(lsD, mssD, bosD, obD, fvgD, hvD)
+
+checkList(int dir) =>
+    bool flowOk = dir > 0 ? chkFlowUp : chkFlowDn
+    (chkSpike ? "✓" : "✗") + " volume spike (z-score " + fmtNum(zScore, "#.#") + ", relative volume " + fmtNum(rvol, "#.##") + "×)\n" +
+     (flowOk ? "✓" : "✗") + " volume flow (money flow " + fmtNum(cmf, "#.##") + ", bullish candle volume " + fmtNum(bullShare * 100, "#") + "%)\n" +
+     (chkPart ? "✓" : "✗") + " participation (" + str.tostring(fastLen) + "-candle average " + fmtNum(volSlow > 0 ? volFast / volSlow : na, "#.##") + "× the " + str.tostring(volLen) + "-candle average)\n" +
+     (trend == dir ? "✓" : "✗") + " market structure " + (trend > 0 ? "bullish" : trend < 0 ? "bearish" : "undefined")
+
+if conf and trigUp and not okUp
+    lastReject := "Buy trigger (" + wordsUp + "): " + (rejU != "" ? rejU : str.tostring(checksUp) + " of 4 checks passed, " + str.tostring(minConf) + " required")
+    lastRejectBar := bar_index
+if conf and trigDn and not okDn
+    lastReject := "Sell trigger (" + wordsDn + "): " + (rejD != "" ? rejD : str.tostring(checksDn) + " of 4 checks passed, " + str.tostring(minConf) + " required")
+    lastRejectBar := bar_index
+
+if okUp
+    memUp.setupIdx := bar_index
+    memUp.setupGrade := gradeUp
+    lastSetupDir := 1
+    lastSetupBar := bar_index
+if okDn
+    memDn.setupIdx := bar_index
+    memDn.setupGrade := gradeDn
+    lastSetupDir := -1
+    lastSetupBar := bar_index
+
+planTip(int dir, string words, int checks, float entry, float sl, float risk, float t1, float t2, float t3, string n1, string n2, string n3, string basis) =>
+    words + "\n" + str.tostring(checks) + " of 4 checks passed (" + str.tostring(minConf) + " required)\n" + checkList(dir) +
+     "\n\nEntry " + fmtPrice(entry) + " (candle close)\nStop loss " + fmtPrice(sl) + " beyond the " + basis + " · distance " + fmtPrice(risk) +
+     "\nTake profit 1 " + fmtPrice(t1) + " · " + n1 + "\nTake profit 2 " + fmtPrice(t2) + " · " + n2 + "\nTake profit 3 " + fmtPrice(t3) + " · " + n3 +
+     "\n\nConfluence only — not financial advice."
+
+addSetupLabel(int dir, string reasons, int checks, string tip) =>
     color col = dir > 0 ? C_BULL : C_BEAR
-    label lb = label.new(bar_index, dir > 0 ? low : high, (dir > 0 ? "BUY SETUP" : "SELL SETUP") + "\n" + reasons,
-         yloc = dir > 0 ? yloc.belowbar : yloc.abovebar, style = dir > 0 ? label.style_label_up : label.style_label_down,
-         color = col, textcolor = color.white, size = size.small)
+    string txt = (dir > 0 ? "BUY SETUP" : "SELL SETUP") + " · " + str.tostring(checks) + "/4\n" + reasons
+    label lb = label.new(bar_index, dir > 0 ? low : high, txt, yloc = dir > 0 ? yloc.belowbar : yloc.abovebar,
+         style = dir > 0 ? label.style_label_up : label.style_label_down, color = col, textcolor = color.white, size = size.small, tooltip = tip)
     setupLabels.push(lb)
     setupDirs.push(dir)
     if setupLabels.size() > MAX_SETUPS
@@ -452,21 +1033,11 @@ addSetupLabel(int dir, string reasons) =>
             label.set_color(setupLabels.get(k), color.new(c, 80))
             label.set_textcolor(setupLabels.get(k), c)
 
-if fireUp
-    lastSetupDir := 1
-    lastSetupBar := bar_index
-    if showSetups
-        addSetupLabel(1, txtUp)
-if fireDn
-    lastSetupDir := -1
-    lastSetupBar := bar_index
-    if showSetups
-        addSetupLabel(-1, txtDn)
-
-addSweepLabel(int dir, float levelPrice) =>
-    label lb = label.new(bar_index, dir > 0 ? low : high, dir > 0 ? "LS ▲" : "LS ▼",
+addSweepLabel(int dir, float levelPrice, bool hv) =>
+    label lb = label.new(bar_index, dir > 0 ? low : high, (dir > 0 ? "LS ▲" : "LS ▼") + (hv ? " · HV" : ""),
          yloc = dir > 0 ? yloc.belowbar : yloc.abovebar, style = dir > 0 ? label.style_label_up : label.style_label_down,
-         color = C_CLEAR, textcolor = dir > 0 ? C_BULL : C_BEAR, size = size.tiny)
+         color = C_CLEAR, textcolor = dir > 0 ? C_BULL : C_BEAR, size = size.tiny,
+         tooltip = "Liquidity sweep: wick through " + fmtPrice(levelPrice) + " and close back inside\n" + volTip)
     label mk = label.new(bar_index, levelPrice, "×", style = label.style_label_center, color = C_CLEAR, textcolor = C_LIQ, size = size.small)
     sweepLabels.push(lb)
     sweepLabels.push(mk)
@@ -474,19 +1045,115 @@ addSweepLabel(int dir, float levelPrice) =>
         label.delete(sweepLabels.shift())
         label.delete(sweepLabels.shift())
 
+// Confirmed setups: label, trade lines and alert — only on closed candles.
+if conf and okUp
+    string tip = planTip(1, wordsUp, checksUp, close, slU, riskU, t1U, t2U, t3U, n1U, n2U, n3U, basisU)
+    if showSetups
+        addSetupLabel(1, reasonText(lsU, mssU, bosU, obU, fvgU, hvU), checksUp, tip)
+    trades.push(newTrade(1, close, slU, t1U, t2U, t3U, n1U, n2U, n3U, wordsUp, basisU, checksUp))
+    alert("Clarity SMC BUY setup confirmed on " + syminfo.ticker + " " + timeframe.period + " — " + wordsUp + ". Entry " + fmtPrice(close) +
+         ", stop loss " + fmtPrice(slU) + ", TP1 " + fmtPrice(t1U) + ", TP2 " + fmtPrice(t2U) + ", TP3 " + fmtPrice(t3U) + ". Not financial advice.", alert.freq_once_per_bar_close)
+if conf and okDn
+    string tip = planTip(-1, wordsDn, checksDn, close, slD, riskD, t1D, t2D, t3D, n1D, n2D, n3D, basisD)
+    if showSetups
+        addSetupLabel(-1, reasonText(lsD, mssD, bosD, obD, fvgD, hvD), checksDn, tip)
+    trades.push(newTrade(-1, close, slD, t1D, t2D, t3D, n1D, n2D, n3D, wordsDn, basisD, checksDn))
+    alert("Clarity SMC SELL setup confirmed on " + syminfo.ticker + " " + timeframe.period + " — " + wordsDn + ". Entry " + fmtPrice(close) +
+         ", stop loss " + fmtPrice(slD) + ", TP1 " + fmtPrice(t1D) + ", TP2 " + fmtPrice(t2D) + ", TP3 " + fmtPrice(t3D) + ". Not financial advice.", alert.freq_once_per_bar_close)
+if conf and trades.size() > keepTrades
+    while trades.size() > keepTrades
+        deleteTrade(trades.shift())
+
 // The setup label already names the sweep, so do not repeat it.
-if showLiq and sweepUpNow and not (showSetups and fireUp and lsUp)
-    addSweepLabel(1, memUp.sweepPrice)
-if showLiq and sweepDnNow and not (showSetups and fireDn and lsDn)
-    addSweepLabel(-1, memDn.sweepPrice)
+if conf and showLiq and sweepUpNow and not (showSetups and okUp and lsU)
+    addSweepLabel(1, memUp.sweepPrice, memUp.sweepHv)
+if conf and showLiq and sweepDnNow and not (showSetups and okDn and lsD)
+    addSweepLabel(-1, memDn.sweepPrice, memDn.sweepHv)
 
-// ───────────────────────── Volume bubbles ─────────────────────────
-float bubR = isHV and showBubbles and conf ? vRatio / hvMult : na
-plotshape(bubR < 1.5 ? hlc3 : na, "HV bubble", shape.circle, location.absolute, color.new(C_HV, 55), size = size.tiny, display = display.pane)
-plotshape(bubR >= 1.5 and bubR < 2.5 ? hlc3 : na, "HV bubble (strong)", shape.circle, location.absolute, color.new(C_HV, 50), size = size.small, display = display.pane)
-plotshape(bubR >= 2.5 ? hlc3 : na, "HV bubble (extreme)", shape.circle, location.absolute, color.new(C_HV, 45), size = size.normal, display = display.pane)
+// Provisional setup on the open candle: one reusable label, hidden once the candle closes.
+var label provLabel = label.new(na, na, "", style = label.style_label_up, color = C_CLEAR, textcolor = C_CLEAR, size = size.small)
+bool provUp = not conf and okUp
+bool provDn = not conf and okDn and not provUp
+if showSetups and (provUp or provDn)
+    int pd = provUp ? 1 : -1
+    label.set_xy(provLabel, bar_index, pd > 0 ? low - 0.5 * atr : high + 0.5 * atr)
+    label.set_style(provLabel, pd > 0 ? label.style_label_up : label.style_label_down)
+    label.set_text(provLabel, (pd > 0 ? "BUY?" : "SELL?") + " provisional\ncandle still open")
+    label.set_color(provLabel, color.new(pd > 0 ? C_BULL : C_BEAR, 80))
+    label.set_textcolor(provLabel, pd > 0 ? C_BULL : C_BEAR)
+    label.set_tooltip(provLabel, "PROVISIONAL — computed from an open candle. It is confirmed only if the conditions still hold at the close.\n" +
+         (pd > 0 ? wordsUp : wordsDn))
+else
+    label.set_text(provLabel, "")
+    label.set_color(provLabel, C_CLEAR)
+    label.set_textcolor(provLabel, C_CLEAR)
 
-// ───────────────────────── Live zones (redrawn on the last bar) ─────────────────────────
+// ═════════════════════════════════════════ Volume events (closed candles) ═════════════════════════════════════════
+if conf and volOk
+    string ev = ""
+    if sweepUpNow and memUp.sweepHv
+        ev := "High volume on a bullish liquidity sweep"
+    else if sweepDnNow and memDn.sweepHv
+        ev := "High volume on a bearish liquidity sweep"
+    else if structHvNow and (structUpNow or structDnNow)
+        ev := "High volume on a " + (structUpNow ? "bullish " : "bearish ") + (lastStructKind == "MSS" ? "market structure shift" : "break of structure")
+    else if obHvTouchUp or obHvTouchDn
+        ev := "High volume at a " + (obHvTouchUp ? "bullish" : "bearish") + " order block"
+    else if fvgHvTouchUp or fvgHvTouchDn
+        ev := "High volume inside a " + (fvgHvTouchUp ? "bullish" : "bearish") + " fair value gap"
+    else if fvgHvNew
+        ev := "Fair value gap created on high volume"
+    else if climaxTop or climaxBottom
+        ev := "Volume climax after an extended " + (climaxTop ? "rise" : "fall") + " (possible exhaustion)"
+    else if fadeTop or fadeBottom
+        ev := "New " + (fadeTop ? "high" : "low") + " on fading volume (possible exhaustion)"
+    else if (strongUp and not strongUp[1]) or (strongDn and not strongDn[1])
+        ev := "Strong " + (strongUp ? "rise" : "fall") + " with expanding volume"
+    if ev != ""
+        lastVolEvent := ev
+        lastVolEventBar := bar_index
+
+// ═════════════════════════════════════════ Volume bubbles ═════════════════════════════════════════
+// Size tier follows relative volume (× bubble scaling); colour follows candle direction;
+// yellow marks extreme statistical spikes. Bubbles are drawn on closed candles only.
+float rvScaled = na(rvol) ? 0.0 : rvol * bubbleScale
+int   capTier  = bubbleMax == "Normal" ? 3 : bubbleMax == "Large" ? 4 : 5
+int   rawTier  = na(rvol) or rvol < bubbleMin ? 0 : rvScaled >= 6 ? 5 : rvScaled >= 4 ? 4 : rvScaled >= 3 ? 3 : rvScaled >= 2 ? 2 : 1
+int   bubTier  = rawTier == 0 ? 0 : math.min(isExtreme ? math.max(rawTier, 3) : rawTier, capTier)
+var int lastBubBar  = na
+var int lastBubTier = 0
+bool bubAllowed = bubTier > 0 and (isExtreme or na(lastBubBar) or bar_index - lastBubBar > bubbleGap or bubTier > lastBubTier)
+bool drawBubble = showBubbles and volOk and conf and bubAllowed
+if drawBubble
+    lastBubBar := bar_index
+    lastBubTier := bubTier
+float bubY     = bubblePlace == "Candle center" ? hl2 : candleDir >= 0 ? low - 0.3 * atr : high + 0.3 * atr
+color bubBase  = isExtreme ? colBubExt : candleDir > 0 ? colBubBull : candleDir < 0 ? colBubBear : C_NEUTRAL
+color bubColor = color.new(bubBase, bubbleTransp)
+
+plotshape(drawBubble and bubTier == 1 ? bubY : na, "Volume bubble (smallest)", shape.circle, location.absolute, bubColor, size = size.tiny, display = display.pane)
+plotshape(drawBubble and bubTier == 2 ? bubY : na, "Volume bubble (small)", shape.circle, location.absolute, bubColor, size = size.small, display = display.pane)
+plotshape(drawBubble and bubTier == 3 ? bubY : na, "Volume bubble (normal)", shape.circle, location.absolute, bubColor, size = size.normal, display = display.pane)
+plotshape(drawBubble and bubTier == 4 ? bubY : na, "Volume bubble (large)", shape.circle, location.absolute, bubColor, size = size.large, display = display.pane)
+plotshape(drawBubble and bubTier == 5 ? bubY : na, "Volume bubble (largest)", shape.circle, location.absolute, bubColor, size = size.huge, display = display.pane)
+
+int strengthLevel = isExtreme ? 3 : isSpike ? 2 : isElevated ? 1 : 0
+int textMinLevel  = bubbleTextMin == "Elevated" ? 1 : bubbleTextMin == "High" ? 2 : 3
+if drawBubble and bubbleText != "None" and strengthLevel >= textMinLevel
+    string bt = bubbleText == "Relative volume" ? fmtNum(rvol, "#.#") + "×" : bubbleText == "Volume" ? fmtVol(vol) : fmtNum(rvol, "#.#") + "× · " + fmtVol(vol)
+    label blb = label.new(bar_index, bubY, bt, style = label.style_label_center, color = C_CLEAR, textcolor = chart.fg_color, size = size.tiny, tooltip = volTip)
+    bubbleLabels.push(blb)
+    if bubbleLabels.size() > MAX_BUB_LABELS
+        label.delete(bubbleLabels.shift())
+
+// Exhaustion markers (interpretation): climax = spike + rejection after an extended move;
+// fading = new extreme on contracting volume.
+plotshape(showExh and conf and climaxTop, "Volume climax at high", shape.xcross, location.abovebar, C_EXH, size = size.tiny, text = "EXH", textcolor = C_EXH, display = display.pane)
+plotshape(showExh and conf and climaxBottom, "Volume climax at low", shape.xcross, location.belowbar, C_EXH, size = size.tiny, text = "EXH", textcolor = C_EXH, display = display.pane)
+plotshape(showExh and conf and fadeTop, "New high on fading volume", shape.diamond, location.abovebar, C_NEUTRAL, size = size.tiny, text = "FADE", textcolor = C_NEUTRAL, display = display.pane)
+plotshape(showExh and conf and fadeBottom, "New low on fading volume", shape.diamond, location.belowbar, C_NEUTRAL, size = size.tiny, text = "FADE", textcolor = C_NEUTRAL, display = display.pane)
+
+// ═════════════════════════════════════════ Live zones (redrawn on the last candle) ═════════════════════════════════════════
 var array<box>   zoneBoxes = array.new<box>()
 var array<line>  liqLines  = array.new<line>()
 var array<label> liqTags   = array.new<label>()
@@ -499,8 +1166,8 @@ if barstate.islast
         box.delete(b)
     for l in liqLines
         line.delete(l)
-    for t in liqTags
-        label.delete(t)
+    for tg in liqTags
+        label.delete(tg)
     zoneBoxes.clear()
     liqLines.clear()
     liqTags.clear()
@@ -514,14 +1181,14 @@ if barstate.islast
                 if g.dir == dir
                     d.push(zoneDist(g.top, g.bottom))
                     ids.push(j)
-            array<int> order = d.sort_indices()
-            int cnt = math.min(maxZones, order.size())
+            array<int> ord = d.sort_indices()
+            int cnt = math.min(maxZones, ord.size())
             if cnt > 0
                 for k = 0 to cnt - 1
-                    Gap g = gaps.get(ids.get(order.get(k)))
+                    Gap g = gaps.get(ids.get(ord.get(k)))
                     color col = dir > 0 ? C_FVG_BULL : C_FVG_BEAR
                     zoneBoxes.push(box.new(g.start, g.top, right, g.bottom, border_color = color.new(col, 70), bgcolor = color.new(col, 85),
-                         text = "FVG", text_size = size.tiny, text_color = col, text_halign = text.align_right, text_valign = text.align_center))
+                         text = "FVG" + (g.hv ? " · HV" : ""), text_size = size.tiny, text_color = col, text_halign = text.align_right, text_valign = text.align_center))
         if showOB
             array<float> d = array.new<float>()
             array<int> ids = array.new<int>()
@@ -529,86 +1196,209 @@ if barstate.islast
                 if z.dir == dir
                     d.push(zoneDist(z.top, z.bottom))
                     ids.push(j)
-            array<int> order = d.sort_indices()
-            int cnt = math.min(maxZones, order.size())
+            array<int> ord = d.sort_indices()
+            int cnt = math.min(maxZones, ord.size())
             if cnt > 0
                 for k = 0 to cnt - 1
-                    Zone z = obs.get(ids.get(order.get(k)))
-                    int fill = na(z.tapped) ? 82 : 90
-                    zoneBoxes.push(box.new(z.idx, z.top, right, z.bottom, border_color = color.new(C_OB, 40), bgcolor = color.new(C_OB, fill),
-                         text = dir > 0 ? "OB ▲" : "OB ▼", text_size = size.tiny, text_color = C_OB, text_halign = text.align_right, text_valign = text.align_center))
+                    Zone z = obs.get(ids.get(ord.get(k)))
+                    int obFill = na(z.tapped) ? 82 : 90
+                    zoneBoxes.push(box.new(z.idx, z.top, right, z.bottom, border_color = color.new(C_OB, 40), bgcolor = color.new(C_OB, obFill),
+                         text = (dir > 0 ? "OB ▲" : "OB ▼") + (z.hv ? " · HV" : ""), text_size = size.tiny, text_color = C_OB, text_halign = text.align_right, text_valign = text.align_center))
         if showLiq
-            // Nearest live levels; levels within 0.25 ATR are one pool (equal highs / lows).
+            // Nearest live levels; levels within the equal-highs/lows tolerance form one pool.
             array<float> d = array.new<float>()
             array<int> ids = array.new<int>()
             for [j, lv] in liqs
                 if lv.dir == dir
                     d.push(math.abs(lv.price - close))
                     ids.push(j)
-            array<int> order = d.sort_indices()
+            array<int> ord = d.sort_indices()
             array<float> picked = array.new<float>()
-            if order.size() > 0
-                for k = 0 to order.size() - 1
-                    if picked.size() >= maxZones
-                        break
-                    Liq lv = liqs.get(ids.get(order.get(k)))
-                    bool dup = false
-                    for p in picked
-                        if math.abs(p - lv.price) <= 0.25 * atr
-                            dup := true
-                    if not dup
+            array<int>   pickedIdx = array.new<int>()
+            array<int>   pickedCnt = array.new<int>()
+            if ord.size() > 0
+                for k = 0 to ord.size() - 1
+                    Liq lv = liqs.get(ids.get(ord.get(k)))
+                    int hit = -1
+                    if picked.size() > 0
+                        for q = 0 to picked.size() - 1
+                            if math.abs(picked.get(q) - lv.price) <= eqTolAtr * atr
+                                hit := q
+                    if hit >= 0
+                        pickedCnt.set(hit, pickedCnt.get(hit) + 1)
+                        pickedIdx.set(hit, math.min(pickedIdx.get(hit), lv.idx))
+                        picked.set(hit, dir > 0 ? math.max(picked.get(hit), lv.price) : math.min(picked.get(hit), lv.price))
+                    else if picked.size() < maxZones
                         picked.push(lv.price)
-                        liqLines.push(line.new(lv.idx, lv.price, right, lv.price, color = color.new(C_LIQ, 10), width = 1))
-                        liqTags.push(label.new(right, lv.price, dir > 0 ? "BSL" : "SSL", style = label.style_label_left, color = C_CLEAR, textcolor = C_LIQ, size = size.tiny))
+                        pickedIdx.push(lv.idx)
+                        pickedCnt.push(1)
+            if picked.size() > 0
+                for q = 0 to picked.size() - 1
+                    bool eq = pickedCnt.get(q) >= 2
+                    string tag = eq ? (dir > 0 ? "EQH" : "EQL") : (dir > 0 ? "BSL" : "SSL")
+                    string poolTip = eq ? (dir > 0 ? "Equal highs: " : "Equal lows: ") + str.tostring(pickedCnt.get(q)) + " swings within " + str.tostring(eqTolAtr) + " ATR, a larger liquidity pool" : dir > 0 ? "Buy-side liquidity above a swing high" : "Sell-side liquidity below a swing low"
+                    liqLines.push(line.new(pickedIdx.get(q), picked.get(q), right, picked.get(q), color = color.new(C_LIQ, 10), width = eq ? 2 : 1))
+                    liqTags.push(label.new(right, picked.get(q), tag, style = label.style_label_left, color = C_CLEAR, textcolor = C_LIQ, size = size.tiny, tooltip = poolTip + "\n" + fmtPrice(picked.get(q))))
 
-// ───────────────────────── Dashboard ─────────────────────────
-pos = dashPos == "Top Right" ? position.top_right : dashPos == "Bottom Right" ? position.bottom_right : dashPos == "Top Left" ? position.top_left : position.bottom_left
-var table dash = table.new(pos, 2, 6, bgcolor = color.new(chart.bg_color, 8), border_color = color.new(chart.fg_color, 88), border_width = 1, frame_color = color.new(chart.fg_color, 80), frame_width = 1)
+// ═════════════════════════════════════════ Dashboard ═════════════════════════════════════════
+dashRow(table tb, int r, string k, string v, color vc, string tsz, string tip) =>
+    table.cell(tb, 0, r, k, text_color = color.new(chart.fg_color, 35), text_halign = text.align_left, text_size = tsz)
+    table.cell(tb, 1, r, v, text_color = vc, text_halign = text.align_right, text_size = tsz, tooltip = tip)
 
-agoText(int bars) =>
-    bars == 0 ? "this bar" : bars == 1 ? "1 bar ago" : str.tostring(bars) + " bars ago"
+dashHeader(table tb, int r, string title, string tsz) =>
+    table.cell(tb, 0, r, title, text_color = color.new(chart.fg_color, 50), text_halign = text.align_left, text_size = tsz, bgcolor = color.new(chart.fg_color, 92))
+    table.cell(tb, 1, r, "", text_size = tsz, bgcolor = color.new(chart.fg_color, 92))
+
+dashLoc = dashPos == "Top Right" ? position.top_right : dashPos == "Bottom Right" ? position.bottom_right : dashPos == "Top Left" ? position.top_left : position.bottom_left
+var table dash = table.new(dashLoc, 2, 30, bgcolor = color.new(chart.bg_color, 6), border_color = color.new(chart.fg_color, 90), border_width = 1,
+     frame_color = color.new(chart.fg_color, 80), frame_width = 1)
 
 if barstate.islast
-    if not showDash
-        table.clear(dash, 0, 0, 1, 5)
-    else
-        int lastClosed = conf ? bar_index : bar_index - 1
-        float cClose = conf ? close : close[1]
-        float cEma = conf ? ema50 : ema50[1]
-        float cRatio = conf ? vRatio : vRatio[1]
+    table.clear(dash, 0, 0, 1, 29)
+    if showDash
+        string tsz = dashSize == "Tiny" ? size.tiny : dashSize == "Normal" ? size.normal : size.small
+        bool detailed = dashMode == "Detailed"
         color fg = chart.fg_color
-        color muted = color.new(fg, 45)
+        int lastClosed = conf ? bar_index : bar_index - 1
 
-        string trendTxt = trend == 1 and cClose > cEma ? "Bullish" : trend == -1 and cClose <= cEma ? "Bearish" : "Neutral"
-        int trendDir = trendTxt == "Bullish" ? 1 : trendTxt == "Bearish" ? -1 : 0
-        string volTxt = na(cRatio) ? "N/A" : cRatio >= hvMult ? "High" : cRatio <= LV_MULT ? "Low" : "Normal"
-        bool structRecent = not na(lastStructBar) and lastClosed - lastStructBar <= 60
-        bool sweepRecent = not na(lastSweepBar) and lastClosed - lastSweepBar <= 30
-        bool setupRecent = not na(lastSetupBar) and lastClosed - lastSetupBar <= 20
+        // Measured values of the last CLOSED candle (the open candle is still changing).
+        float mVol   = conf ? vol : vol[1]
+        float mRvol  = conf ? rvol : rvol[1]
+        float mZ     = conf ? zScore : zScore[1]
+        string mStr  = conf ? volStrength : volStrength[1]
+        string mBase = conf ? baseDesc : baseDesc[1]
+        float mFast  = conf ? volFast : volFast[1]
+        float mSlow  = conf ? volSlow : volSlow[1]
+        float mShare = conf ? bullShare : bullShare[1]
+        float mClose = conf ? close : close[1]
+        float mEma   = conf ? ema50 : ema50[1]
+        bool  mExp   = conf ? volExpanding : volExpanding[1]
+        bool  mCon   = conf ? volContracting : volContracting[1]
+        string mPat  = conf ? volPattern : volPattern[1]
+        // Structure state as of the last closed candle (the open candle may still change it).
+        int    cTrend      = conf ? trend : trend[1]
+        string cStructKind = conf ? lastStructKind : lastStructKind[1]
+        int    cStructDir  = conf ? lastStructDir : lastStructDir[1]
+        int    cStructBar  = conf ? lastStructBar : lastStructBar[1]
+        bool   cStructHv   = conf ? lastStructHv : lastStructHv[1]
+        int    cSweepDir   = conf ? lastSweepDir : lastSweepDir[1]
+        int    cSweepBar   = conf ? lastSweepBar : lastSweepBar[1]
+        int    cSetupDir   = conf ? lastSetupDir : lastSetupDir[1]
+        int    cSetupBar   = conf ? lastSetupBar : lastSetupBar[1]
 
-        int score = trendDir != 0 ? trendDir * 2 : trend
-        score += structRecent ? lastStructDir : 0
-        score += sweepRecent ? lastSweepDir : 0
-        score += setupRecent ? lastSetupDir : 0
-        string bias = score >= 2 ? "BULLISH" : score <= -2 ? "BEARISH" : "NEUTRAL"
-        string strength = bias == "NEUTRAL" ? "" : math.abs(score) >= 4 ? "Strong " : "Moderate "
-        color biasCol = score >= 2 ? C_BULL : score <= -2 ? C_BEAR : color.new(C_NEUTRAL, 40)
+        string dirTxt = cTrend == 1 and mClose > mEma ? "Bullish" : cTrend == -1 and mClose <= mEma ? "Bearish" : "Neutral"
+        int dirInt = dirTxt == "Bullish" ? 1 : dirTxt == "Bearish" ? -1 : 0
+        bool structRecent = not na(cStructBar) and lastClosed - cStructBar <= 60
+        bool sweepRecent  = not na(cSweepBar) and lastClosed - cSweepBar <= 30
+        bool setupRecent  = not na(cSetupBar) and lastClosed - cSetupBar <= 20
+        int score = dirInt != 0 ? dirInt * 2 : cTrend
+        score += structRecent ? cStructDir : 0
+        score += sweepRecent ? cSweepDir : 0
+        score += setupRecent ? cSetupDir : 0
+        string bias = score >= 2 ? "Bullish" : score <= -2 ? "Bearish" : "Neutral"
+        string biasStrength = bias == "Neutral" ? "" : math.abs(score) >= 4 ? " (strong)" : " (moderate)"
+        color strCol = mStr == "Extreme" ? C_HV : mStr == "High" ? C_HV : mStr == "Elevated" ? fg : mStr == "Low" ? C_NEUTRAL : fg
 
-        table.cell(dash, 0, 0, "OVERALL BIAS", text_color = muted, text_size = size.small, text_halign = text.align_left)
-        table.cell(dash, 1, 0, strength + bias, bgcolor = biasCol, text_color = color.white, text_size = size.small)
-        table.cell(dash, 0, 1, "Trend", text_color = muted, text_size = size.small, text_halign = text.align_left)
-        table.cell(dash, 1, 1, "● " + trendTxt, text_color = trendDir > 0 ? C_BULL : trendDir < 0 ? C_BEAR : fg, text_size = size.small, text_halign = text.align_right)
-        table.cell(dash, 0, 2, "Volume", text_color = muted, text_size = size.small, text_halign = text.align_left)
-        table.cell(dash, 1, 2, volTxt + (na(cRatio) ? "" : "  " + str.tostring(cRatio, "#.0") + "× avg"), text_color = volTxt == "High" ? C_HV : fg, text_size = size.small, text_halign = text.align_right)
-        table.cell(dash, 0, 3, "Structure", text_color = muted, text_size = size.small, text_halign = text.align_left)
-        table.cell(dash, 1, 3, structRecent ? lastStructKind + (lastStructDir > 0 ? " ▲  " : " ▼  ") + agoText(lastClosed - lastStructBar) : "None",
-             text_color = structRecent ? (lastStructDir > 0 ? C_BULL : C_BEAR) : fg, text_size = size.small, text_halign = text.align_right)
-        table.cell(dash, 0, 4, "Liquidity sweep", text_color = muted, text_size = size.small, text_halign = text.align_left)
-        table.cell(dash, 1, 4, sweepRecent ? (lastSweepDir > 0 ? "Bullish  " : "Bearish  ") + agoText(lastClosed - lastSweepBar) : "None",
-             text_color = sweepRecent ? (lastSweepDir > 0 ? C_BULL : C_BEAR) : fg, text_size = size.small, text_halign = text.align_right)
+        int r = 0
+        dashHeader(dash, r, "MEASURED DATA · last closed candle", tsz)
+        r += 1
+        dashRow(dash, r, "Current Volume", volOk ? fmtVol(mVol) + " " + volUnit : "No volume data on this symbol", fg, tsz,
+             isTick ? "Tick volume counts price updates, not traded contracts. Compare it only with itself (relative volume)." : "Volume reported by the data feed.")
+        r += 1
+        dashRow(dash, r, "Relative Volume", volOk ? fmtNum(mRvol, "#.##") + "× (" + mBase + ")" : "Unavailable", fg, tsz,
+             "Relative volume = candle volume / baseline average of the " + mBase + ".")
+        r += 1
+        dashRow(dash, r, "Volume Strength", volOk ? mStr + " · " + fmtNum(mZ, "#.#") + " standard deviations" : "Unavailable", strCol, tsz,
+             "Z-score of log relative volume against the previous " + str.tostring(volLen) + " candles. " +
+             "Low ≤ " + str.tostring(lowRvol) + "× · Elevated ≥ " + str.tostring(rvolThresh) + "× · High: z-score ≥ " + str.tostring(stdMult) + " and relative volume ≥ " + str.tostring(rvolThresh) + "× · Extreme: z-score ≥ " + str.tostring(extremeMult))
+        r += 1
+        if detailed
+            dashRow(dash, r, "Volume Trend", mExp ? "Expanding" : mCon ? "Contracting" : "Stable", fg, tsz,
+                 str.tostring(fastLen) + "-candle average is " + fmtNum(mSlow > 0 ? mFast / mSlow : na, "#.##") + "× the " + str.tostring(volLen) + "-candle average")
+            r += 1
+            dashRow(dash, r, "Bullish / Bearish Volume", volOk ? fmtNum(mShare * 100, "#") + "% / " + fmtNum((1 - mShare) * 100, "#") + "% (" + str.tostring(flowLen) + " candles)" : "Unavailable", fg, tsz,
+                 "Share of volume on bullish vs bearish candles. Based on candle direction, not on actual buyer or seller orders.")
+            r += 1
+            dashRow(dash, r, "Live Candle Volume", conf ? "Candle closed" : fmtVol(vol) + " so far (candle still open)", C_NEUTRAL, tsz, "Measured, but incomplete until the candle closes.")
+            r += 1
 
-// ───────────────────────── Alerts ─────────────────────────
-alertcondition(fireUp, "BUY SETUP", "Clarity SMC: BUY SETUP on {{ticker}} ({{interval}})")
-alertcondition(fireDn, "SELL SETUP", "Clarity SMC: SELL SETUP on {{ticker}} ({{interval}})")
+        dashHeader(dash, r, "ANALYSIS · interpretation, not certainty", tsz)
+        r += 1
+        dashRow(dash, r, "Market Direction", dirTxt, dirInt > 0 ? C_BULL : dirInt < 0 ? C_BEAR : fg, tsz,
+             "Bullish when the last structure break was bullish and price is above the 50-period EMA; bearish for the opposite; otherwise neutral.")
+        r += 1
+        if detailed
+            dashRow(dash, r, "Market Structure", structRecent ? (cStructDir > 0 ? "Bullish " : "Bearish ") + (cStructKind == "MSS" ? "Market Structure Shift" : "Break of Structure") + (cStructHv ? " on high volume" : "") + " · " + agoText(lastClosed - cStructBar) : "None recently",
+                 structRecent ? (cStructDir > 0 ? C_BULL : C_BEAR) : fg, tsz, "")
+            r += 1
+            dashRow(dash, r, "Liquidity Sweep", sweepRecent ? (cSweepDir > 0 ? "Bullish · " : "Bearish · ") + agoText(lastClosed - cSweepBar) : "None recently",
+                 sweepRecent ? (cSweepDir > 0 ? C_BULL : C_BEAR) : fg, tsz, "")
+            r += 1
+            dashRow(dash, r, "Volume Pattern", mPat, fg, tsz, "Interpretation of money flow and net price movement over " + str.tostring(flowLen) + " candles. It does not identify who traded.")
+            r += 1
+            dashRow(dash, r, "Last Volume Event", na(lastVolEventBar) ? lastVolEvent : lastVolEvent + " · " + agoText(lastClosed - lastVolEventBar), fg, tsz, "")
+            r += 1
+            dashRow(dash, r, "Overall Bias", bias + biasStrength, bias == "Bullish" ? C_BULL : bias == "Bearish" ? C_BEAR : fg, tsz,
+                 "Score " + str.tostring(score) + ": direction ±2, recent structure ±1, recent sweep ±1, recent setup ±1.")
+            r += 1
+
+        dashHeader(dash, r, "TRADE SETUP", tsz)
+        r += 1
+        bool haveTrade = trades.size() > 0
+        Trade tr = haveTrade ? trades.last() : na
+        if provUp or provDn
+            int pd = provUp ? 1 : -1
+            float pSl = pd > 0 ? slU : slD
+            float pRisk = pd > 0 ? riskU : riskD
+            dashRow(dash, r, "Trading Setup", (pd > 0 ? "Buy · " : "Sell · ") + (pd > 0 ? wordsUp : wordsDn), pd > 0 ? C_BULL : C_BEAR, tsz, "")
+            r += 1
+            dashRow(dash, r, "Confirmation Status", "Provisional · candle still open (" + str.tostring(pd > 0 ? checksUp : checksDn) + " of 4 checks)", C_HV, tsz, checkList(pd))
+            r += 1
+            dashRow(dash, r, "Entry Price", fmtPrice(close) + " (live, not final)", fg, tsz, "")
+            r += 1
+            dashRow(dash, r, "Stop Loss", fmtPrice(pSl) + " · distance " + fmtPrice(pRisk), C_SL, tsz, pd > 0 ? basisU : basisD)
+            r += 1
+            dashRow(dash, r, "Take Profit 1", fmtPrice(pd > 0 ? t1U : t1D), C_TP1, tsz, pd > 0 ? n1U : n1D)
+            r += 1
+            dashRow(dash, r, "Take Profit 2", fmtPrice(pd > 0 ? t2U : t2D), C_TP2, tsz, pd > 0 ? n2U : n2D)
+            r += 1
+            dashRow(dash, r, "Take Profit 3", fmtPrice(pd > 0 ? t3U : t3D), C_TP3, tsz, pd > 0 ? n3U : n3D)
+            r += 1
+        else if haveTrade
+            float rk = (tr.entry - tr.sl) * tr.dir
+            dashRow(dash, r, "Trading Setup", (tr.dir > 0 ? "Buy · " : "Sell · ") + tr.reasons + " · " + agoText(lastClosed - tr.startIdx), tr.dir > 0 ? C_BULL : C_BEAR, tsz, "")
+            r += 1
+            dashRow(dash, r, "Confirmation Status", "Confirmed at candle close · " + str.tostring(tr.checks) + " of 4 checks (" + str.tostring(minConf) + " required)", fg, tsz, "")
+            r += 1
+            dashRow(dash, r, "Entry Price", fmtPrice(tr.entry), tr.dir > 0 ? C_BULL : C_BEAR, tsz, "Close of the confirmation candle.")
+            r += 1
+            dashRow(dash, r, "Stop Loss", fmtPrice(tr.sl) + " · distance " + fmtPrice(rk) + (atr > 0 ? " (" + str.tostring(rk / atr, "#.##") + " ATR)" : ""), C_SL, tsz, "Beyond the " + tr.slBasis)
+            r += 1
+            dashRow(dash, r, "Take Profit 1", fmtPrice(tr.tp1), C_TP1, tsz, tr.tp1Name)
+            r += 1
+            dashRow(dash, r, "Take Profit 2", fmtPrice(tr.tp2), C_TP2, tsz, tr.tp2Name)
+            r += 1
+            dashRow(dash, r, "Take Profit 3", fmtPrice(tr.tp3), C_TP3, tsz, tr.tp3Name)
+            r += 1
+            dashRow(dash, r, "Risk-to-Reward Ratio", rrText(tr.tp1, tr.entry, rk, tr.dir) + " · " + rrText(tr.tp2, tr.entry, rk, tr.dir) + " · " + rrText(tr.tp3, tr.entry, rk, tr.dir), fg, tsz,
+                 "Reward ÷ risk for take profit 1, 2 and 3.")
+            r += 1
+            dashRow(dash, r, "Trade Status", tradeStatusText(tr), tr.status == 1 ? C_TP2 : tr.status == -1 or tr.status == -3 ? C_SL : fg, tsz, "Evaluated on closed candles using their high and low.")
+            r += 1
+        else
+            dashRow(dash, r, "Trading Setup", "None yet", fg, tsz, "")
+            r += 1
+            dashRow(dash, r, "Confirmation Status", volOk ? "Waiting for a trigger with " + str.tostring(minConf) + " of 4 checks" : "Volume checks unavailable on this symbol", fg, tsz, "")
+            r += 1
+        if detailed
+            dashRow(dash, r, "Last Rejected Trigger", na(lastRejectBar) ? lastReject : lastReject + " · " + agoText(lastClosed - lastRejectBar), C_NEUTRAL, tsz,
+                 "Triggers that did not pass the checks or the maximum stop distance. Shown for transparency.")
+            r += 1
+
+// ═════════════════════════════════════════ Alerts ═════════════════════════════════════════
+alertcondition(conf and okUp, "BUY SETUP", "Clarity SMC: BUY SETUP confirmed on {{ticker}} ({{interval}})")
+alertcondition(conf and okDn, "SELL SETUP", "Clarity SMC: SELL SETUP confirmed on {{ticker}} ({{interval}})")
 alertcondition(conf and (sweepUpNow or sweepDnNow), "Liquidity sweep", "Clarity SMC: liquidity sweep on {{ticker}} ({{interval}})")
 alertcondition(conf and (mssUpNow or mssDnNow), "Market structure shift", "Clarity SMC: MSS on {{ticker}} ({{interval}})")
+alertcondition(conf and isSpike, "High volume spike", "Clarity SMC: statistically significant volume spike on {{ticker}} ({{interval}})")
+alertcondition(conf and (climaxTop or climaxBottom or fadeTop or fadeBottom), "Volume exhaustion", "Clarity SMC: possible volume exhaustion on {{ticker}} ({{interval}})")
