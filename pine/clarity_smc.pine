@@ -415,9 +415,10 @@ pivotLow(int len) =>
 bool ph = pivotHigh(swingLen)
 bool pl = pivotLow(swingLen)
 
-spikeSince(int fromIdx) =>
+spikeSince(bool active, int fromIdx) =>
+    // Called on every candle; the loop only runs when `active`.
     bool found = false
-    int n = math.min(bar_index - fromIdx, 60)
+    int n = active ? math.min(bar_index - fromIdx, 60) : -1
     if n >= 0
         for k = 0 to n
             if isSpike[k]
@@ -477,9 +478,11 @@ trimSide(array<Liq> arr, int dir, int maxN) =>
                 arr.remove(j)
                 break
 
-makeOB(array<Zone> zones, int dir, int fromIdx, string origin, float atrNow) =>
+makeOB(bool active, array<Zone> zones, int dir, int fromIdx, string origin, float atrNow) =>
+    // Called on every candle (TradingView requires this for functions that read past values). When no
+    // structure break happened (`active` false) the loops run a single step and nothing is created.
     // Origin of the impulse leg: extreme candle between the broken swing and the break.
-    int span = math.max(1, math.min(bar_index - fromIdx, 300))
+    int span = active ? math.max(1, math.min(bar_index - fromIdx, 300)) : 1
     int km = 0
     for k = 0 to span - 1
         if dir > 0 ? low[k] < low[km] : high[k] > high[km]
@@ -504,7 +507,7 @@ makeOB(array<Zone> zones, int dir, int fromIdx, string origin, float atrNow) =>
         if isSpike[k]
             legHv := true
             break
-    if top > bot and top - bot <= 3 * atrNow
+    if active and top > bot and top - bot <= 3 * atrNow
         if zones.size() > 0
             for j = zones.size() - 1 to 0
                 Zone z = zones.get(j)
@@ -565,6 +568,7 @@ reasonWords(bool ls, bool mss, bool bos, bool ob, bool fvg, bool hv) =>
 
 // ICT trigger: one of the enabled confluence patterns (same rules as v1, HV = statistical spike).
 evalSetup(DirMem m, bool obRetest, bool mssNow) =>
+    bool spikeAfterSweep = spikeSince(mssNow and not na(m.sweepIdx), m.sweepIdx - 1)
     bool rLS  = false
     bool rMSS = false
     bool rBOS = false
@@ -582,7 +586,7 @@ evalSetup(DirMem m, bool obRetest, bool mssNow) =>
     if cBosOb and obRetest
         rBOS := true
         rOB := true
-    if cSweepMssHv and mssNow and not na(m.sweepIdx) and not m.sweepUsedMss and bar_index - m.sweepIdx <= SWEEP_MSS_WIN and spikeSince(m.sweepIdx - 1)
+    if cSweepMssHv and mssNow and not na(m.sweepIdx) and not m.sweepUsedMss and bar_index - m.sweepIdx <= SWEEP_MSS_WIN and spikeAfterSweep
         m.sweepUsedMss := true
         rLS := true
         rMSS := true
@@ -680,12 +684,9 @@ ictTargets(int dir, float entry, float risk, float atrNow) =>
 
 // Complete trade plan for a trigger: stop, risk, three targets, and a rejection reason if any.
 buildPlan(bool active, int dir, float entry, bool useSweep, int sweepIdx, bool useOb, float obLevel, float swingLevel, float fallback, float atrNow) =>
-    float sl = na
-    string basis = ""
-    if active
-        [s0, b0] = stopFor(dir, entry, useSweep, sweepIdx, useOb, obLevel, swingLevel, fallback, atrNow)
-        sl := s0
-        basis := b0
+    [s0, b0] = stopFor(dir, entry, useSweep, sweepIdx, useOb, obLevel, swingLevel, fallback, atrNow)
+    float sl = active ? s0 : na
+    string basis = active ? b0 : ""
     float risk = (entry - sl) * dir
     string reject = ""
     if active and maxRiskAtr > 0 and atrNow > 0 and risk > maxRiskAtr * atrNow
@@ -959,12 +960,13 @@ if liqs.size() > 0
         lastSweepBar := bar_index
 
 // 4) Market structure (close-based) + order blocks
-if not swHiBroken and close > swHiPrice
-    string kind = trend == -1 ? "MSS" : "BOS"
+bool   brkUp  = not swHiBroken and close > swHiPrice
+string kindUp = trend == -1 ? "MSS" : "BOS"
+if brkUp
+    string kind = kindUp
     bool hv = isSpike or isSpike[1]
     swHiBroken := true
     trend := 1
-    makeOB(obs, 1, swHiIdx, kind, atr)
     lastStructKind := kind
     lastStructDir := 1
     lastStructBar := bar_index
@@ -977,13 +979,15 @@ if not swHiBroken and close > swHiPrice
         mssUpNow := true
     if conf and showStruct
         drawStructure(kind, 1, swHiIdx, swHiPrice, hv)
+makeOB(brkUp, obs, 1, swHiIdx, kindUp, atr)
 
-if not swLoBroken and close < swLoPrice
-    string kind = trend == 1 ? "MSS" : "BOS"
+bool   brkDn  = not swLoBroken and close < swLoPrice
+string kindDn = trend == 1 ? "MSS" : "BOS"
+if brkDn
+    string kind = kindDn
     bool hv = isSpike or isSpike[1]
     swLoBroken := true
     trend := -1
-    makeOB(obs, -1, swLoIdx, kind, atr)
     lastStructKind := kind
     lastStructDir := -1
     lastStructBar := bar_index
@@ -996,6 +1000,7 @@ if not swLoBroken and close < swLoPrice
         mssDnNow := true
     if conf and showStruct
         drawStructure(kind, -1, swLoIdx, swLoPrice, hv)
+makeOB(brkDn, obs, -1, swLoIdx, kindDn, atr)
 
 // Fading volume (FADE): the first candle that takes out the previous swing high (low) does so on a
 // 3-candle push whose average volume is below `fadeRatio` × the volume that formed that swing.
@@ -1235,14 +1240,14 @@ plotshape(showExh and conf and fadeBottom, "Swing low taken on fading volume", s
 // ═════════════════════════════════════════ EMA ribbon and ICT killzones ═════════════════════════════════════════
 pEmaFast = plot(showEMA ? emaFast : na, "EMA ribbon fast", color = #22D3EE, linewidth = 1, display = display.pane)
 pEmaSlow = plot(showEMA ? emaSlow : na, "EMA ribbon slow", color = #F59E0B, linewidth = 1, display = display.pane)
-fill(pEmaFast, pEmaSlow, color = emaFast > emaSlow ? color.new(C_BULL, 88) : color.new(C_BEAR, 88), title = "EMA ribbon fill", display = display.pane)
+fill(pEmaFast, pEmaSlow, color = emaFast > emaSlow ? color.new(C_BULL, 88) : color.new(C_BEAR, 88), title = "EMA ribbon fill")
 
 bool kzChart  = timeframe.isintraday and tfSec <= 3600
 bool kzAsia   = not na(time(timeframe.period, "2000-2359", "America/New_York"))
 bool kzLondon = not na(time(timeframe.period, "0200-0500", "America/New_York"))
 bool kzNY     = not na(time(timeframe.period, "0700-1000", "America/New_York"))
 string kzName = kzLondon ? "London killzone" : kzNY ? "New York killzone" : kzAsia ? "Asia session" : "Outside killzones"
-bgcolor(showKZ and kzChart ? (kzLondon ? color.new(#3B82F6, 93) : kzNY ? color.new(#A855F7, 93) : kzAsia ? color.new(#94A3B8, 95) : na) : na, title = "ICT killzones", display = display.pane)
+bgcolor(showKZ and kzChart ? (kzLondon ? color.new(#3B82F6, 93) : kzNY ? color.new(#A855F7, 93) : kzAsia ? color.new(#94A3B8, 95) : na) : na, title = "ICT killzones")
 
 // ═════════════════════════════════════════ Previous day / week levels ═════════════════════════════════════════
 var int dayStartIdx  = 0
