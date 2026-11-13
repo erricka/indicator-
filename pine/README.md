@@ -32,7 +32,7 @@ feature reports **No volume data** instead of guessing.
 | Quantity | Formula | Notes |
 | --- | --- | --- |
 | Candle volume | `volume` | Measured. |
-| Baseline average | **Same time of day** (default): mean volume of the same clock slot (UTC) over the last *N* sessions (default 10). **Rolling bars**: mean of the previous 20 candles. | The current candle is always excluded. Time of day needs ≥ 3 sessions for a slot, so it uses the rolling average until then. The dashboard says which one is in use. |
+| Baseline average | **Same time of day** (default): mean volume of the same clock slot, in the exchange's time zone so it follows daylight-saving changes, over the last *N* sessions (default 10). **Rolling bars**: mean of the previous 20 candles. | The current candle is always excluded. Time of day needs ≥ 3 sessions for a slot, so it uses the rolling average until then. The dashboard says which one is in use. |
 | Relative volume | `volume / baseline average` | 1.0× is a normal candle for that time of day. |
 | Z-score | `(ln(relative volume) − mean) / standard deviation`, where mean and standard deviation are taken over `ln(relative volume)` of the previous 20 candles | Logs are used because volume is strongly right-skewed. See below. |
 | Volume strength | **Low**: relative volume ≤ 0.6× · **Normal** · **Elevated**: relative volume ≥ 1.5× · **High**: z ≥ 2.0 *and* relative volume ≥ 1.5× · **Extreme**: High *and* z ≥ 3.0 | A spike needs both conditions, so a tiny standard deviation alone cannot create one. |
@@ -105,7 +105,7 @@ A **BUY SETUP** or **SELL SETUP** needs three things.
    - BOS + Order Block retest (first retest, rejected by a candle closing in the trend direction)
    - Liquidity Sweep + MSS + Volume Spike (within 20 candles)
 
-**2. At least *Required checks* (default 2) of these 4 checks:**
+**2. At least 2 of these 4 checks.** The number is the *Required checks* input (0–4).
    1. **Volume spike:** High or Extreme on the trigger candle or the 2 before it.
    2. **Volume flow agrees:** money flow beyond ±0.05, or ≥ 55% of volume on candles in the trade direction.
    3. **Participation rising:** 5-candle average volume above the 20-candle average.
@@ -184,7 +184,7 @@ default (up to 3).
 | Analysis (interpretation) | Market Direction: last structure break plus position vs the 50-period EMA |
 | Trade setup | Trading Setup, Confirmation Status, Entry Price, Stop Loss, Take Profit 1, Take Profit 2, Take Profit 3, Risk-to-Reward Ratio, Trade Status |
 
-Every value has a tooltip explaining how it was calculated.
+Every value has a tooltip explaining how it was calculated. Hover *Confirmation Status* to see which of the 4 checks passed.
 
 ## 8. Accuracy and data integrity
 

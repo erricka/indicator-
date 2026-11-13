@@ -218,6 +218,7 @@ type Trade
     label  lbTp2
     label  lbTp3
     label  lbDone
+    string checkTip = ""
 
 // ═════════════════════════════════════════ Formatting helpers ═════════════════════════════════════════
 fmtPrice(float p) =>
@@ -1058,14 +1059,18 @@ if conf and okUp
     string tip = planTip(1, wordsUp, checksUp, close, slU, riskU, t1U, t2U, t3U, n1U, n2U, n3U, basisU)
     if showSetups
         addSetupLabel(1, reasonText(lsU, mssU, bosU, obU, fvgU, hvU), checksUp, tip)
-    trades.push(newTrade(1, close, slU, t1U, t2U, t3U, n1U, n2U, n3U, wordsUp, basisU, checksUp))
+    Trade ntU = newTrade(1, close, slU, t1U, t2U, t3U, n1U, n2U, n3U, wordsUp, basisU, checksUp)
+    ntU.checkTip := checkList(1)
+    trades.push(ntU)
     alert("Clarity SMC BUY setup confirmed on " + syminfo.ticker + " " + timeframe.period + " — " + wordsUp + ". Entry " + fmtPrice(close) +
          ", stop loss " + fmtPrice(slU) + ", TP1 " + fmtPrice(t1U) + ", TP2 " + fmtPrice(t2U) + ", TP3 " + fmtPrice(t3U) + ". Not financial advice.", alert.freq_once_per_bar_close)
 if conf and okDn
     string tip = planTip(-1, wordsDn, checksDn, close, slD, riskD, t1D, t2D, t3D, n1D, n2D, n3D, basisD)
     if showSetups
         addSetupLabel(-1, reasonText(lsD, mssD, bosD, obD, fvgD, hvD), checksDn, tip)
-    trades.push(newTrade(-1, close, slD, t1D, t2D, t3D, n1D, n2D, n3D, wordsDn, basisD, checksDn))
+    Trade ntD = newTrade(-1, close, slD, t1D, t2D, t3D, n1D, n2D, n3D, wordsDn, basisD, checksDn)
+    ntD.checkTip := checkList(-1)
+    trades.push(ntD)
     alert("Clarity SMC SELL setup confirmed on " + syminfo.ticker + " " + timeframe.period + " — " + wordsDn + ". Entry " + fmtPrice(close) +
          ", stop loss " + fmtPrice(slD) + ", TP1 " + fmtPrice(t1D) + ", TP2 " + fmtPrice(t2D) + ", TP3 " + fmtPrice(t3D) + ". Not financial advice.", alert.freq_once_per_bar_close)
 if conf and trades.size() > keepTrades
@@ -1337,14 +1342,17 @@ if barstate.islast
         r += 1
         if detailed
             dashRow(dash, r, "Market Structure", structRecent ? (cStructDir > 0 ? "Bullish " : "Bearish ") + (cStructKind == "MSS" ? "Market Structure Shift" : "Break of Structure") + (cStructHv ? " on high volume" : "") + " · " + agoText(lastClosed - cStructBar) : "None recently",
-                 structRecent ? (cStructDir > 0 ? C_BULL : C_BEAR) : fg, tsz, "")
+                 structRecent ? (cStructDir > 0 ? C_BULL : C_BEAR) : fg, tsz,
+                 "Latest close beyond a confirmed swing within 60 candles. Against the prior trend it is a Market Structure Shift, with the trend a Break of Structure. 'On high volume' means a spike on the break candle or the one before.")
             r += 1
             dashRow(dash, r, "Liquidity Sweep", sweepRecent ? (cSweepDir > 0 ? "Bullish · " : "Bearish · ") + agoText(lastClosed - cSweepBar) : "None recently",
-                 sweepRecent ? (cSweepDir > 0 ? C_BULL : C_BEAR) : fg, tsz, "")
+                 sweepRecent ? (cSweepDir > 0 ? C_BULL : C_BEAR) : fg, tsz,
+                 "Latest wick through liquidity that had rested at least " + str.tostring(MIN_SWEEP_AGE) + " candles, closing back inside, within 30 candles. Bullish = sell-side liquidity taken below a swing low.")
             r += 1
             dashRow(dash, r, "Volume Pattern", mPat, fg, tsz, "Interpretation of money flow and net price movement over " + str.tostring(flowLen) + " candles. It does not identify who traded.")
             r += 1
-            dashRow(dash, r, "Last Volume Event", na(lastVolEventBar) ? lastVolEvent : lastVolEvent + " · " + agoText(lastClosed - lastVolEventBar), fg, tsz, "")
+            dashRow(dash, r, "Last Volume Event", na(lastVolEventBar) ? lastVolEvent : lastVolEvent + " · " + agoText(lastClosed - lastVolEventBar), fg, tsz,
+                 "Most recent closed candle where a statistical volume spike coincided with a sweep, structure break, order block or fair value gap, or where a climax / fading-volume pattern appeared.")
             r += 1
             dashRow(dash, r, "Overall Bias", bias + biasStrength, bias == "Bullish" ? C_BULL : bias == "Bearish" ? C_BEAR : fg, tsz,
                  "Score " + str.tostring(score) + ": direction ±2, recent structure ±1, recent sweep ±1, recent setup ±1.")
@@ -1358,11 +1366,12 @@ if barstate.islast
             int pd = provUp ? 1 : -1
             float pSl = pd > 0 ? slU : slD
             float pRisk = pd > 0 ? riskU : riskD
-            dashRow(dash, r, "Trading Setup", (pd > 0 ? "Buy · " : "Sell · ") + (pd > 0 ? wordsUp : wordsDn), pd > 0 ? C_BULL : C_BEAR, tsz, "")
+            dashRow(dash, r, "Trading Setup", (pd > 0 ? "Buy · " : "Sell · ") + (pd > 0 ? wordsUp : wordsDn), pd > 0 ? C_BULL : C_BEAR, tsz,
+                 "The ICT trigger that is forming on the open candle.")
             r += 1
             dashRow(dash, r, "Confirmation Status", "Provisional · candle still open (" + str.tostring(pd > 0 ? checksUp : checksDn) + " of 4 checks)", C_HV, tsz, checkList(pd))
             r += 1
-            dashRow(dash, r, "Entry Price", fmtPrice(close) + " (live, not final)", fg, tsz, "")
+            dashRow(dash, r, "Entry Price", fmtPrice(close) + " (live, not final)", fg, tsz, "The entry becomes the candle close if the setup is still valid when the candle closes.")
             r += 1
             dashRow(dash, r, "Stop Loss", fmtPrice(pSl) + " · distance " + fmtPrice(pRisk), C_SL, tsz, pd > 0 ? basisU : basisD)
             r += 1
@@ -1372,11 +1381,15 @@ if barstate.islast
             r += 1
             dashRow(dash, r, "Take Profit 3", fmtPrice(pd > 0 ? t3U : t3D), C_TP3, tsz, pd > 0 ? n3U : n3D)
             r += 1
+            dashRow(dash, r, "Risk-to-Reward Ratio", rrText(pd > 0 ? t1U : t1D, close, pRisk, pd) + " · " + rrText(pd > 0 ? t2U : t2D, close, pRisk, pd) + " · " + rrText(pd > 0 ? t3U : t3D, close, pRisk, pd), fg, tsz,
+                 "Reward ÷ risk for take profit 1, 2 and 3, using the live price as entry.")
+            r += 1
         else if haveTrade
             float rk = (tr.entry - tr.sl) * tr.dir
-            dashRow(dash, r, "Trading Setup", (tr.dir > 0 ? "Buy · " : "Sell · ") + tr.reasons + " · " + agoText(lastClosed - tr.startIdx), tr.dir > 0 ? C_BULL : C_BEAR, tsz, "")
+            dashRow(dash, r, "Trading Setup", (tr.dir > 0 ? "Buy · " : "Sell · ") + tr.reasons + " · " + agoText(lastClosed - tr.startIdx), tr.dir > 0 ? C_BULL : C_BEAR, tsz,
+                 "The ICT trigger behind the latest confirmed setup.")
             r += 1
-            dashRow(dash, r, "Confirmation Status", "Confirmed at candle close · " + str.tostring(tr.checks) + " of 4 checks (" + str.tostring(minConf) + " required)", fg, tsz, "")
+            dashRow(dash, r, "Confirmation Status", "Confirmed at candle close · " + str.tostring(tr.checks) + " of 4 checks (" + str.tostring(minConf) + " required)", fg, tsz, tr.checkTip)
             r += 1
             dashRow(dash, r, "Entry Price", fmtPrice(tr.entry), tr.dir > 0 ? C_BULL : C_BEAR, tsz, "Close of the confirmation candle.")
             r += 1
@@ -1394,9 +1407,10 @@ if barstate.islast
             dashRow(dash, r, "Trade Status", tradeStatusText(tr), tr.status == 1 ? C_TP2 : tr.status == -1 or tr.status == -3 ? C_SL : fg, tsz, "Evaluated on closed candles using their high and low.")
             r += 1
         else
-            dashRow(dash, r, "Trading Setup", "None yet", fg, tsz, "")
+            dashRow(dash, r, "Trading Setup", "None yet", fg, tsz, "No trigger has passed the checks on the loaded history.")
             r += 1
-            dashRow(dash, r, "Confirmation Status", volOk ? "Waiting for a trigger with " + str.tostring(minConf) + " of 4 checks" : "Volume checks unavailable on this symbol", fg, tsz, "")
+            dashRow(dash, r, "Confirmation Status", volOk ? "Waiting for a trigger with " + str.tostring(minConf) + " of 4 checks" : "Volume checks unavailable on this symbol", fg, tsz,
+                 "A setup needs one of the enabled ICT triggers plus at least " + str.tostring(minConf) + " of the 4 volume and structure checks.")
             r += 1
         if detailed
             dashRow(dash, r, "Last Rejected Trigger", na(lastRejectBar) ? lastReject : lastReject + " · " + agoText(lastClosed - lastRejectBar), C_NEUTRAL, tsz,
