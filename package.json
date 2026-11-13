@@ -1,0 +1,20 @@
+{
+  "name": "clarity-smc",
+  "version": "1.0.0",
+  "description": "Clean, institutional-style Smart Money Concepts chart: liquidity, BOS/MSS, order blocks, FVG, volume bubbles and confluence setups.",
+  "type": "module",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "lightweight-charts": "5.2.1"
+  },
+  "license": "MIT"
+}

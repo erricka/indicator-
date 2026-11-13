@@ -1,0 +1,614 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// Clarity SMC — the same rules as the Clarity SMC web chart, for TradingView.
+// Liquidity (BSL/SSL/LS), structure (BOS/MSS), order blocks, fair value gaps, volume bubbles
+// and confluence-only BUY / SELL SETUP labels. Signals are evaluated on closed bars only.
+// Setups highlight confluence — they are not trade advice and outcomes are never guaranteed.
+
+//@version=6
+indicator("Clarity SMC — Liquidity · Structure · Confluence", "Clarity SMC", overlay = true,
+     max_boxes_count = 60, max_lines_count = 120, max_labels_count = 200, max_bars_back = 500)
+
+// ───────────────────────── Inputs ─────────────────────────
+grpD = "Display"
+showBubbles = input.bool(true, "Volume Bubbles", group = grpD)
+showLiq     = input.bool(true, "Liquidity (BSL · SSL · LS)", group = grpD)
+showStruct  = input.bool(true, "BOS / MSS", group = grpD)
+showOB      = input.bool(true, "Order Blocks", group = grpD)
+showFVG     = input.bool(true, "Fair Value Gaps", group = grpD)
+showDash    = input.bool(true, "Dashboard", group = grpD)
+showSetups  = input.bool(true, "Buy / Sell Setup Labels", group = grpD)
+
+grpC = "Setup confirmations (BUY / SELL appear only when one lines up)"
+cSweepHv    = input.bool(true, "Liquidity Sweep + High Volume", group = grpC)
+cMssFvg     = input.bool(true, "MSS + Fair Value Gap", group = grpC)
+cBosOb      = input.bool(true, "BOS + Order Block retest", group = grpC)
+cSweepMssHv = input.bool(true, "Liquidity Sweep + MSS + Volume Spike", group = grpC)
+
+grpS = "Sensitivity"
+swingLen = input.int(5, "Swing length", minval = 2, maxval = 30, group = grpS)
+hvMult   = input.float(2.0, "High-volume threshold (× average)", minval = 1.1, maxval = 10, step = 0.1, group = grpS)
+maxZones = input.int(2, "Zones / levels per side", minval = 1, maxval = 5, group = grpS)
+dashPos  = input.string("Top Right", "Dashboard position", options = ["Top Right", "Bottom Right", "Top Left", "Bottom Left"], group = grpS)
+
+// ───────────────────────── Constants ─────────────────────────
+int   VOL_LEN           = 20
+float LV_MULT           = 0.6
+int   EMA_LEN           = 50
+float FVG_MIN_ATR       = 0.2
+float SETUP_FVG_MIN_ATR = 0.35
+int   MIN_SWEEP_AGE     = 10
+int   COOLDOWN          = 10
+int   MSS_FVG_WIN       = 3
+int   SWEEP_MSS_WIN     = 20
+int   OB_RETEST_MAX     = 80
+int   LIQ_MAX_AGE       = 500
+int   FVG_MAX_AGE       = 300
+int   OB_MAX_AGE        = 500
+int   MAX_TRACKED       = 12
+int   MAX_STRUCT        = 6
+int   MAX_SWEEPS        = 5
+int   MAX_SETUPS        = 6
+int   EXTEND            = 8
+
+// Colour system: green bullish, red bearish, blue liquidity, yellow volume,
+// purple order blocks, light blue / light red fair value gaps.
+color C_BULL     = #22C55E
+color C_BEAR     = #EF4444
+color C_LIQ      = #3B82F6
+color C_HV       = #FACC15
+color C_OB       = #A855F7
+color C_FVG_BULL = #7DD3FC
+color C_FVG_BEAR = #F87171
+color C_NEUTRAL  = #94A3B8
+color C_CLEAR    = color.new(color.white, 100)
+
+// ───────────────────────── Types ─────────────────────────
+type Liq
+    float price
+    int   idx
+    int   dir
+
+type Zone
+    int    dir
+    int    idx
+    int    created
+    float  top
+    float  bottom
+    string origin
+    int    tapped     = na
+    bool   retestDone = false
+
+type Gap
+    int   dir
+    int   start
+    int   created
+    float top
+    float bottom
+
+type DirMem
+    int   sweepIdx     = na
+    float sweepPrice   = na
+    bool  sweepHv      = false
+    bool  sweepUsedHv  = true
+    bool  sweepUsedMss = true
+    int   mssIdx       = na
+    bool  mssUsedFvg   = true
+    int   fvgIdx       = na
+    int   setupIdx     = na
+    int   setupGrade   = 0
+
+// ───────────────────────── Core series ─────────────────────────
+bool  conf   = barstate.isconfirmed
+float atr    = ta.atr(14)
+float ema50  = ta.ema(close, EMA_LEN)
+float vAvg   = ta.sma(nz(volume), VOL_LEN)[1]
+bool  hasVol = ta.cum(nz(volume) > 0 ? 1 : 0) > bar_index * 0.5
+float vRatio = hasVol and vAvg > 0 ? nz(volume) / vAvg : na
+bool  isHV   = not na(vRatio) and vRatio >= hvMult
+
+pivotHigh(int len) =>
+    bool ok = bar_index >= 2 * len
+    if ok
+        float v = high[len]
+        for k = 1 to len
+            if high[len + k] >= v or high[len - k] > v
+                ok := false
+                break
+    ok
+
+pivotLow(int len) =>
+    bool ok = bar_index >= 2 * len
+    if ok
+        float v = low[len]
+        for k = 1 to len
+            if low[len + k] <= v or low[len - k] < v
+                ok := false
+                break
+    ok
+
+bool ph = pivotHigh(swingLen)
+bool pl = pivotLow(swingLen)
+
+hvSince(int fromIdx) =>
+    bool found = false
+    int n = math.min(bar_index - fromIdx, 60)
+    if n >= 0
+        for k = 0 to n
+            if isHV[k]
+                found := true
+                break
+    found
+
+// ───────────────────────── State ─────────────────────────
+var array<Liq>  liqs = array.new<Liq>()
+var array<Zone> obs  = array.new<Zone>()
+var array<Gap>  gaps = array.new<Gap>()
+var DirMem memUp = DirMem.new()
+var DirMem memDn = DirMem.new()
+
+var int   trend    = 0
+var float shPrice  = na
+var int   shIdx    = na
+var bool  shBroken = true
+var float slPrice  = na
+var int   slIdx    = na
+var bool  slBroken = true
+
+var string lastStructKind = ""
+var int    lastStructDir  = 0
+var int    lastStructBar  = na
+var int    lastSweepDir   = 0
+var int    lastSweepBar   = na
+var int    lastSetupDir   = 0
+var int    lastSetupBar   = na
+
+var array<line>  structLines  = array.new<line>()
+var array<label> structLabels = array.new<label>()
+var array<label> sweepLabels  = array.new<label>()
+var array<label> setupLabels  = array.new<label>()
+var array<int>   setupDirs    = array.new<int>()
+
+trimSide(array<Liq> arr, int dir, int maxN) =>
+    int cnt = 0
+    for lv in arr
+        if lv.dir == dir
+            cnt += 1
+    if cnt > maxN
+        for j = 0 to arr.size() - 1
+            if arr.get(j).dir == dir
+                arr.remove(j)
+                break
+
+makeOB(array<Zone> zones, int dir, int fromIdx, string origin, float atrNow) =>
+    // Origin of the impulse leg: extreme candle between the broken swing and the break.
+    int span = math.min(bar_index - fromIdx, 300)
+    int km = 0
+    for k = 0 to span - 1
+        if dir > 0 ? low[k] < low[km] : high[k] > high[km]
+            km := k
+    // Prefer the last opposite-colour candle at (or just before) the extreme.
+    int kob = km
+    int kmax = math.min(km + 2, span - 1)
+    for k = km to kmax
+        if dir > 0 ? close[k] < open[k] : close[k] > open[k]
+            kob := k
+            break
+    float top = dir > 0 ? high[kob] : math.max(high[kob], high[km])
+    float bot = dir > 0 ? math.min(low[kob], low[km]) : low[kob]
+    if top - bot > 2.5 * atrNow
+        if dir > 0
+            top := math.max(open[kob], close[kob])
+        else
+            bot := math.min(open[kob], close[kob])
+    if top > bot and top - bot <= 3 * atrNow
+        if zones.size() > 0
+            for j = zones.size() - 1 to 0
+                Zone z = zones.get(j)
+                if z.dir == dir and z.bottom <= top and z.top >= bot
+                    zones.remove(j)
+        zones.push(Zone.new(dir, bar_index - kob, bar_index, top, bot, origin))
+        if zones.size() > MAX_TRACKED * 2
+            zones.shift()
+
+addGap(array<Gap> arr, int dir, float bot, float top) =>
+    bool merged = false
+    if arr.size() > 0
+        for j = arr.size() - 1 to 0
+            Gap g = arr.get(j)
+            if g.dir == dir and bar_index - g.created <= 2 and bot <= g.top and top >= g.bottom
+                g.top := math.max(g.top, top)
+                g.bottom := math.min(g.bottom, bot)
+                g.created := bar_index
+                merged := true
+                break
+    if not merged
+        arr.push(Gap.new(dir, bar_index - 1, bar_index, top, bot))
+        if arr.size() > MAX_TRACKED * 2
+            arr.shift()
+
+reasonText(bool ls, bool mss, bool bos, bool ob, bool fvg, bool hv) =>
+    array<string> parts = array.new<string>()
+    if ls
+        parts.push("LS")
+    if mss
+        parts.push("MSS")
+    if bos
+        parts.push("BOS")
+    if ob
+        parts.push("OB")
+    if fvg
+        parts.push("FVG")
+    if hv
+        parts.push("HV")
+    parts.join(" · ")
+
+evalSetup(DirMem m, bool obRetest, bool mssNow, bool ok) =>
+    bool rLS = false
+    bool rMSS = false
+    bool rBOS = false
+    bool rOB = false
+    bool rFVG = false
+    bool rHV = false
+    if ok
+        if cSweepHv and not na(m.sweepIdx) and not m.sweepUsedHv and m.sweepIdx == bar_index and m.sweepHv
+            m.sweepUsedHv := true
+            rLS := true
+            rHV := true
+        if cMssFvg and not na(m.mssIdx) and not m.mssUsedFvg and bar_index - m.mssIdx <= MSS_FVG_WIN and not na(m.fvgIdx) and m.fvgIdx >= m.mssIdx - MSS_FVG_WIN
+            m.mssUsedFvg := true
+            rMSS := true
+            rFVG := true
+        if cBosOb and obRetest
+            rBOS := true
+            rOB := true
+        if cSweepMssHv and mssNow and not na(m.sweepIdx) and not m.sweepUsedMss and bar_index - m.sweepIdx <= SWEEP_MSS_WIN and hvSince(m.sweepIdx - 1)
+            m.sweepUsedMss := true
+            rLS := true
+            rMSS := true
+            rHV := true
+    int grade = (rLS ? 1 : 0) + (rMSS ? 1 : 0) + (rBOS ? 1 : 0) + (rOB ? 1 : 0) + (rFVG ? 1 : 0) + (rHV ? 1 : 0)
+    bool fire = grade > 0 and (na(m.setupIdx) or bar_index - m.setupIdx >= COOLDOWN or grade > m.setupGrade)
+    if fire
+        m.setupIdx := bar_index
+        m.setupGrade := grade
+    [fire, reasonText(rLS, rMSS, rBOS, rOB, rFVG, rHV), rLS]
+
+drawStructure(string kind, int dir, int fromIdx, float price) =>
+    color col = dir > 0 ? C_BULL : C_BEAR
+    line ln = line.new(fromIdx, price, bar_index, price, color = color.new(col, kind == "MSS" ? 0 : 25), style = line.style_dashed, width = 1)
+    label lb = label.new(math.round((fromIdx + bar_index) / 2.0), price, kind, style = dir > 0 ? label.style_label_down : label.style_label_up, color = C_CLEAR, textcolor = col, size = size.tiny)
+    structLines.push(ln)
+    structLabels.push(lb)
+    if structLines.size() > MAX_STRUCT
+        line.delete(structLines.shift())
+        label.delete(structLabels.shift())
+
+// ───────────────────────── Per-bar engine (closed bars only) ─────────────────────────
+bool obRetestUp = false
+bool obRetestDn = false
+bool sweepUpNow = false
+bool sweepDnNow = false
+bool mssUpNow   = false
+bool mssDnNow   = false
+
+// 1) Order block mitigation and retest confirmation
+if conf and obs.size() > 0
+    for j = obs.size() - 1 to 0
+        Zone z = obs.get(j)
+        if bar_index > z.created
+            bool dead = bar_index - z.created > OB_MAX_AGE or (z.dir > 0 ? close < z.bottom : close > z.top)
+            if dead
+                obs.remove(j)
+            else
+                bool touched = z.dir > 0 ? low <= z.top : high >= z.bottom
+                if touched and na(z.tapped)
+                    z.tapped := bar_index
+                if not na(z.tapped) and not z.retestDone and bar_index - z.tapped <= 2
+                    bool held = z.dir > 0 ? close > open and close > z.bottom : close < open and close < z.top
+                    if held
+                        z.retestDone := true
+                        if z.origin == "BOS" and trend == z.dir and z.tapped - z.created >= 2 and z.tapped - z.created <= OB_RETEST_MAX
+                            if z.dir > 0
+                                obRetestUp := true
+                            else
+                                obRetestDn := true
+
+// 2) Fair value gap mitigation — gaps shrink as they fill and disappear once closed
+if conf and gaps.size() > 0
+    for j = gaps.size() - 1 to 0
+        Gap g = gaps.get(j)
+        if bar_index > g.created
+            if bar_index - g.created > FVG_MAX_AGE
+                gaps.remove(j)
+            else if g.dir > 0
+                if low <= g.bottom
+                    gaps.remove(j)
+                else if low < g.top
+                    g.top := low
+            else
+                if high >= g.top
+                    gaps.remove(j)
+                else if high > g.bottom
+                    g.bottom := high
+
+// 3) Liquidity: sweep (wick through, close back inside) or break (close through)
+if conf and liqs.size() > 0
+    float bestBsl = na
+    int   bestBslIdx = na
+    float bestSsl = na
+    int   bestSslIdx = na
+    for j = liqs.size() - 1 to 0
+        Liq lv = liqs.get(j)
+        if bar_index - lv.idx > LIQ_MAX_AGE
+            liqs.remove(j)
+            continue
+        bool pierced = lv.dir > 0 ? high > lv.price : low < lv.price
+        if pierced
+            bool back = lv.dir > 0 ? close < lv.price : close > lv.price
+            liqs.remove(j)
+            if back
+                if lv.dir > 0 and (na(bestBsl) or lv.price > bestBsl)
+                    bestBsl := lv.price
+                    bestBslIdx := lv.idx
+                if lv.dir < 0 and (na(bestSsl) or lv.price < bestSsl)
+                    bestSsl := lv.price
+                    bestSslIdx := lv.idx
+    // Only liquidity that has rested for a while counts as a meaningful sweep.
+    if not na(bestBsl) and bar_index - bestBslIdx >= MIN_SWEEP_AGE
+        memDn.sweepIdx := bar_index
+        memDn.sweepPrice := bestBsl
+        memDn.sweepHv := isHV or isHV[1]
+        memDn.sweepUsedHv := false
+        memDn.sweepUsedMss := false
+        sweepDnNow := true
+        lastSweepDir := -1
+        lastSweepBar := bar_index
+    if not na(bestSsl) and bar_index - bestSslIdx >= MIN_SWEEP_AGE
+        memUp.sweepIdx := bar_index
+        memUp.sweepPrice := bestSsl
+        memUp.sweepHv := isHV or isHV[1]
+        memUp.sweepUsedHv := false
+        memUp.sweepUsedMss := false
+        sweepUpNow := true
+        lastSweepDir := 1
+        lastSweepBar := bar_index
+
+// 4) Market structure (close-based) + order blocks
+if conf and not shBroken and close > shPrice
+    string kind = trend == -1 ? "MSS" : "BOS"
+    shBroken := true
+    trend := 1
+    makeOB(obs, 1, shIdx, kind, atr)
+    lastStructKind := kind
+    lastStructDir := 1
+    lastStructBar := bar_index
+    if kind == "MSS"
+        memUp.mssIdx := bar_index
+        memUp.mssUsedFvg := false
+        mssUpNow := true
+    if showStruct
+        drawStructure(kind, 1, shIdx, shPrice)
+
+if conf and not slBroken and close < slPrice
+    string kind = trend == 1 ? "MSS" : "BOS"
+    slBroken := true
+    trend := -1
+    makeOB(obs, -1, slIdx, kind, atr)
+    lastStructKind := kind
+    lastStructDir := -1
+    lastStructBar := bar_index
+    if kind == "MSS"
+        memDn.mssIdx := bar_index
+        memDn.mssUsedFvg := false
+        mssDnNow := true
+    if showStruct
+        drawStructure(kind, -1, slIdx, slPrice)
+
+// 5) Swing confirmation -> liquidity levels
+if conf and ph
+    shPrice := high[swingLen]
+    shIdx := bar_index - swingLen
+    shBroken := false
+    liqs.push(Liq.new(shPrice, shIdx, 1))
+    trimSide(liqs, 1, MAX_TRACKED)
+if conf and pl
+    slPrice := low[swingLen]
+    slIdx := bar_index - swingLen
+    slBroken := false
+    liqs.push(Liq.new(slPrice, slIdx, -1))
+    trimSide(liqs, -1, MAX_TRACKED)
+
+// 6) Fair value gaps (candles 1-2-3)
+if conf and bar_index >= 2 and atr > 0
+    float minGap = FVG_MIN_ATR * atr
+    if low > high[2] and low - high[2] >= minGap and close[1] > open[1]
+        if low - high[2] >= SETUP_FVG_MIN_ATR * atr
+            memUp.fvgIdx := bar_index
+        addGap(gaps, 1, high[2], low)
+    if high < low[2] and low[2] - high >= minGap and close[1] < open[1]
+        if low[2] - high >= SETUP_FVG_MIN_ATR * atr
+            memDn.fvgIdx := bar_index
+        addGap(gaps, -1, high, low[2])
+
+// 7) Confluence setups
+[fireUp, txtUp, lsUp] = evalSetup(memUp, obRetestUp, mssUpNow, conf)
+[fireDn, txtDn, lsDn] = evalSetup(memDn, obRetestDn, mssDnNow, conf)
+
+addSetupLabel(int dir, string reasons) =>
+    color col = dir > 0 ? C_BULL : C_BEAR
+    label lb = label.new(bar_index, dir > 0 ? low : high, (dir > 0 ? "BUY SETUP" : "SELL SETUP") + "\n" + reasons,
+         yloc = dir > 0 ? yloc.belowbar : yloc.abovebar, style = dir > 0 ? label.style_label_up : label.style_label_down,
+         color = col, textcolor = color.white, size = size.small)
+    setupLabels.push(lb)
+    setupDirs.push(dir)
+    if setupLabels.size() > MAX_SETUPS
+        label.delete(setupLabels.shift())
+        setupDirs.shift()
+    // Latest two stay solid; older setups become outlines so the newest reads first.
+    int n = setupLabels.size()
+    if n > 2
+        for k = 0 to n - 3
+            color c = setupDirs.get(k) > 0 ? C_BULL : C_BEAR
+            label.set_color(setupLabels.get(k), color.new(c, 80))
+            label.set_textcolor(setupLabels.get(k), c)
+
+if fireUp
+    lastSetupDir := 1
+    lastSetupBar := bar_index
+    if showSetups
+        addSetupLabel(1, txtUp)
+if fireDn
+    lastSetupDir := -1
+    lastSetupBar := bar_index
+    if showSetups
+        addSetupLabel(-1, txtDn)
+
+addSweepLabel(int dir, float levelPrice) =>
+    label lb = label.new(bar_index, dir > 0 ? low : high, dir > 0 ? "LS ▲" : "LS ▼",
+         yloc = dir > 0 ? yloc.belowbar : yloc.abovebar, style = dir > 0 ? label.style_label_up : label.style_label_down,
+         color = C_CLEAR, textcolor = dir > 0 ? C_BULL : C_BEAR, size = size.tiny)
+    label mk = label.new(bar_index, levelPrice, "×", style = label.style_label_center, color = C_CLEAR, textcolor = C_LIQ, size = size.small)
+    sweepLabels.push(lb)
+    sweepLabels.push(mk)
+    if sweepLabels.size() > MAX_SWEEPS * 2
+        label.delete(sweepLabels.shift())
+        label.delete(sweepLabels.shift())
+
+// The setup label already names the sweep, so do not repeat it.
+if showLiq and sweepUpNow and not (showSetups and fireUp and lsUp)
+    addSweepLabel(1, memUp.sweepPrice)
+if showLiq and sweepDnNow and not (showSetups and fireDn and lsDn)
+    addSweepLabel(-1, memDn.sweepPrice)
+
+// ───────────────────────── Volume bubbles ─────────────────────────
+float bubR = isHV and showBubbles and conf ? vRatio / hvMult : na
+plotshape(bubR < 1.5 ? hlc3 : na, "HV bubble", shape.circle, location.absolute, color.new(C_HV, 55), size = size.tiny, display = display.pane)
+plotshape(bubR >= 1.5 and bubR < 2.5 ? hlc3 : na, "HV bubble (strong)", shape.circle, location.absolute, color.new(C_HV, 50), size = size.small, display = display.pane)
+plotshape(bubR >= 2.5 ? hlc3 : na, "HV bubble (extreme)", shape.circle, location.absolute, color.new(C_HV, 45), size = size.normal, display = display.pane)
+
+// ───────────────────────── Live zones (redrawn on the last bar) ─────────────────────────
+var array<box>   zoneBoxes = array.new<box>()
+var array<line>  liqLines  = array.new<line>()
+var array<label> liqTags   = array.new<label>()
+
+zoneDist(float top, float bottom) =>
+    close > top ? close - top : close < bottom ? bottom - close : 0.0
+
+if barstate.islast
+    for b in zoneBoxes
+        box.delete(b)
+    for l in liqLines
+        line.delete(l)
+    for t in liqTags
+        label.delete(t)
+    zoneBoxes.clear()
+    liqLines.clear()
+    liqTags.clear()
+    int right = bar_index + EXTEND
+
+    for dir in array.from(1, -1)
+        if showFVG
+            array<float> d = array.new<float>()
+            array<int> ids = array.new<int>()
+            for [j, g] in gaps
+                if g.dir == dir
+                    d.push(zoneDist(g.top, g.bottom))
+                    ids.push(j)
+            array<int> order = d.sort_indices()
+            int cnt = math.min(maxZones, order.size())
+            if cnt > 0
+                for k = 0 to cnt - 1
+                    Gap g = gaps.get(ids.get(order.get(k)))
+                    color col = dir > 0 ? C_FVG_BULL : C_FVG_BEAR
+                    zoneBoxes.push(box.new(g.start, g.top, right, g.bottom, border_color = color.new(col, 70), bgcolor = color.new(col, 85),
+                         text = "FVG", text_size = size.tiny, text_color = col, text_halign = text.align_right, text_valign = text.align_center))
+        if showOB
+            array<float> d = array.new<float>()
+            array<int> ids = array.new<int>()
+            for [j, z] in obs
+                if z.dir == dir
+                    d.push(zoneDist(z.top, z.bottom))
+                    ids.push(j)
+            array<int> order = d.sort_indices()
+            int cnt = math.min(maxZones, order.size())
+            if cnt > 0
+                for k = 0 to cnt - 1
+                    Zone z = obs.get(ids.get(order.get(k)))
+                    int fill = na(z.tapped) ? 82 : 90
+                    zoneBoxes.push(box.new(z.idx, z.top, right, z.bottom, border_color = color.new(C_OB, 40), bgcolor = color.new(C_OB, fill),
+                         text = dir > 0 ? "OB ▲" : "OB ▼", text_size = size.tiny, text_color = C_OB, text_halign = text.align_right, text_valign = text.align_center))
+        if showLiq
+            // Nearest live levels; levels within 0.25 ATR are one pool (equal highs / lows).
+            array<float> d = array.new<float>()
+            array<int> ids = array.new<int>()
+            for [j, lv] in liqs
+                if lv.dir == dir
+                    d.push(math.abs(lv.price - close))
+                    ids.push(j)
+            array<int> order = d.sort_indices()
+            array<float> picked = array.new<float>()
+            if order.size() > 0
+                for k = 0 to order.size() - 1
+                    if picked.size() >= maxZones
+                        break
+                    Liq lv = liqs.get(ids.get(order.get(k)))
+                    bool dup = false
+                    for p in picked
+                        if math.abs(p - lv.price) <= 0.25 * atr
+                            dup := true
+                    if not dup
+                        picked.push(lv.price)
+                        liqLines.push(line.new(lv.idx, lv.price, right, lv.price, color = color.new(C_LIQ, 10), width = 1))
+                        liqTags.push(label.new(right, lv.price, dir > 0 ? "BSL" : "SSL", style = label.style_label_left, color = C_CLEAR, textcolor = C_LIQ, size = size.tiny))
+
+// ───────────────────────── Dashboard ─────────────────────────
+pos = dashPos == "Top Right" ? position.top_right : dashPos == "Bottom Right" ? position.bottom_right : dashPos == "Top Left" ? position.top_left : position.bottom_left
+var table dash = table.new(pos, 2, 6, bgcolor = color.new(chart.bg_color, 8), border_color = color.new(chart.fg_color, 88), border_width = 1, frame_color = color.new(chart.fg_color, 80), frame_width = 1)
+
+agoText(int bars) =>
+    bars == 0 ? "this bar" : bars == 1 ? "1 bar ago" : str.tostring(bars) + " bars ago"
+
+if barstate.islast
+    if not showDash
+        table.clear(dash, 0, 0, 1, 5)
+    else
+        int lastClosed = conf ? bar_index : bar_index - 1
+        float cClose = conf ? close : close[1]
+        float cEma = conf ? ema50 : ema50[1]
+        float cRatio = conf ? vRatio : vRatio[1]
+        color fg = chart.fg_color
+        color muted = color.new(fg, 45)
+
+        string trendTxt = trend == 1 and cClose > cEma ? "Bullish" : trend == -1 and cClose <= cEma ? "Bearish" : "Neutral"
+        int trendDir = trendTxt == "Bullish" ? 1 : trendTxt == "Bearish" ? -1 : 0
+        string volTxt = na(cRatio) ? "N/A" : cRatio >= hvMult ? "High" : cRatio <= LV_MULT ? "Low" : "Normal"
+        bool structRecent = not na(lastStructBar) and lastClosed - lastStructBar <= 60
+        bool sweepRecent = not na(lastSweepBar) and lastClosed - lastSweepBar <= 30
+        bool setupRecent = not na(lastSetupBar) and lastClosed - lastSetupBar <= 20
+
+        int score = trendDir != 0 ? trendDir * 2 : trend
+        score += structRecent ? lastStructDir : 0
+        score += sweepRecent ? lastSweepDir : 0
+        score += setupRecent ? lastSetupDir : 0
+        string bias = score >= 2 ? "BULLISH" : score <= -2 ? "BEARISH" : "NEUTRAL"
+        string strength = bias == "NEUTRAL" ? "" : math.abs(score) >= 4 ? "Strong " : "Moderate "
+        color biasCol = score >= 2 ? C_BULL : score <= -2 ? C_BEAR : color.new(C_NEUTRAL, 40)
+
+        table.cell(dash, 0, 0, "OVERALL BIAS", text_color = muted, text_size = size.small, text_halign = text.align_left)
+        table.cell(dash, 1, 0, strength + bias, bgcolor = biasCol, text_color = color.white, text_size = size.small)
+        table.cell(dash, 0, 1, "Trend", text_color = muted, text_size = size.small, text_halign = text.align_left)
+        table.cell(dash, 1, 1, "● " + trendTxt, text_color = trendDir > 0 ? C_BULL : trendDir < 0 ? C_BEAR : fg, text_size = size.small, text_halign = text.align_right)
+        table.cell(dash, 0, 2, "Volume", text_color = muted, text_size = size.small, text_halign = text.align_left)
+        table.cell(dash, 1, 2, volTxt + (na(cRatio) ? "" : "  " + str.tostring(cRatio, "#.0") + "× avg"), text_color = volTxt == "High" ? C_HV : fg, text_size = size.small, text_halign = text.align_right)
+        table.cell(dash, 0, 3, "Structure", text_color = muted, text_size = size.small, text_halign = text.align_left)
+        table.cell(dash, 1, 3, structRecent ? lastStructKind + (lastStructDir > 0 ? " ▲  " : " ▼  ") + agoText(lastClosed - lastStructBar) : "None",
+             text_color = structRecent ? (lastStructDir > 0 ? C_BULL : C_BEAR) : fg, text_size = size.small, text_halign = text.align_right)
+        table.cell(dash, 0, 4, "Liquidity sweep", text_color = muted, text_size = size.small, text_halign = text.align_left)
+        table.cell(dash, 1, 4, sweepRecent ? (lastSweepDir > 0 ? "Bullish  " : "Bearish  ") + agoText(lastClosed - lastSweepBar) : "None",
+             text_color = sweepRecent ? (lastSweepDir > 0 ? C_BULL : C_BEAR) : fg, text_size = size.small, text_halign = text.align_right)
+
+// ───────────────────────── Alerts ─────────────────────────
+alertcondition(fireUp, "BUY SETUP", "Clarity SMC: BUY SETUP on {{ticker}} ({{interval}})")
+alertcondition(fireDn, "SELL SETUP", "Clarity SMC: SELL SETUP on {{ticker}} ({{interval}})")
+alertcondition(conf and (sweepUpNow or sweepDnNow), "Liquidity sweep", "Clarity SMC: liquidity sweep on {{ticker}} ({{interval}})")
+alertcondition(conf and (mssUpNow or mssDnNow), "Market structure shift", "Clarity SMC: MSS on {{ticker}} ({{interval}})")

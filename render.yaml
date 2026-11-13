@@ -1,0 +1,16 @@
+# Render Blueprint — free web service (https://render.com/docs/blueprint-spec)
+services:
+  - type: web
+    name: clarity-smc
+    runtime: node
+    plan: free
+    region: oregon
+    buildCommand: npm ci --omit=dev
+    startCommand: node server.js
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "22"
