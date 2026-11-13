@@ -6,7 +6,7 @@
 // bubbles, confluence setups, dashboard, alerts) and adds:
 //   • statistical volume analysis (relative volume, standard-deviation spikes, time-of-day baseline,
 //     bullish vs bearish candle volume, money flow, accumulation/distribution-like patterns,
-//     climax and fading-volume exhaustion)
+//     volume climax and fading volume at swings — descriptions of volume, not reversal signals)
 //   • volume-proportional bubbles coloured by candle direction, yellow for extreme spikes, with values
 //   • volume confirmation of ICT events and a measurable confirmation count for every setup
 //   • automatic stop loss, three take-profit levels (risk-to-reward or ICT liquidity targets),
@@ -36,7 +36,8 @@ showOB      = input.bool(true, "Order blocks", group = G1, display = display.non
 showFVG     = input.bool(true, "Fair value gaps", group = G1, display = display.none)
 showSetups  = input.bool(true, "Buy / sell setup labels", group = G1, display = display.none)
 showTrades  = input.bool(true, "Entry, stop loss and take profit lines", group = G1, display = display.none)
-showExh     = input.bool(true, "Volume exhaustion markers", group = G1, display = display.none)
+showExh     = input.bool(false, "Volume exhaustion markers (EXH / FADE)", group = G1, display = display.none,
+     tooltip = "Off by default: on gold 1m–1h these markers showed no measurable reversal tendency (price reversed about 50% of the time, the same as after any new high or low). They describe volume behaviour, not a signal.")
 showDash    = input.bool(true, "Dashboard", group = G1, display = display.none)
 
 G2 = "2 · Volume analysis"
@@ -57,6 +58,8 @@ flowLen     = input.int(20, "Volume flow period", minval = 5, maxval = 200, grou
 cmfThresh   = input.float(0.05, "Money flow threshold", minval = 0.0, maxval = 0.5, step = 0.01, group = G2, display = display.none)
 exLen       = input.int(10, "Exhaustion lookback (bars)", minval = 3, maxval = 100, group = G2, display = display.none)
 exAtr       = input.float(3.0, "Exhaustion: minimum prior move (ATR)", minval = 0.5, maxval = 20.0, step = 0.5, group = G2, display = display.none)
+fadeRatio   = input.float(0.5, "Fading volume: push below (× swing volume)", minval = 0.1, maxval = 1.0, step = 0.05, group = G2, display = display.none,
+     tooltip = "FADE marks the candle that takes out the previous swing high (low) when the average volume of that 3-candle push is below this fraction of the average volume of the 3 candles that formed the swing.")
 volTypeIn   = input.string("Auto-detect", "Volume data type", options = ["Auto-detect", "Exchange volume", "Tick volume"], group = G2, display = display.none,
      tooltip = "Auto-detect treats Forex and CFD symbols (most XAUUSD feeds) as tick volume. Futures such as COMEX gold report exchange volume.")
 
@@ -335,19 +338,15 @@ string volPattern = not volOk ? "Unavailable (no volume data)" :
      flowBull and netMove < -1.5 ? "Divergence: falling price, positive money flow" :
      flowBear and netMove > 1.5 ? "Divergence: rising price, negative money flow" : "Balanced"
 
-// Exhaustion: (a) climax — spike at the end of an extended move with rejection,
-//             (b) fading — new high/low made on shrinking volume.
+// Volume climax (EXH): a statistical spike at the end of an extended move, with a rejection wick.
+// (Fading volume, FADE, is measured against the previous swing in the ICT engine below.)
 float hhEx      = ta.highest(high, exLen)
 float llEx      = ta.lowest(low, exLen)
-float hhPrev    = ta.highest(high, exLen)[1]
-float llPrev    = ta.lowest(low, exLen)[1]
 float barRange  = high - low
 float upperWick = high - math.max(open, close)
 float lowerWick = math.min(open, close) - low
 bool climaxTop    = isSpike and atr > 0 and barRange > 0 and high >= hhEx and high - llEx >= exAtr * atr and (upperWick >= 0.4 * barRange or close < hl2)
 bool climaxBottom = isSpike and atr > 0 and barRange > 0 and low <= llEx and hhEx - low >= exAtr * atr and (lowerWick >= 0.4 * barRange or close > hl2)
-bool fadeTop      = volOk and not climaxTop and high > hhPrev and volContracting and not na(rvol) and rvol < 1.0
-bool fadeBottom   = volOk and not climaxBottom and low < llPrev and volContracting and not na(rvol) and rvol < 1.0
 float move3       = atr > 0 ? (close - close[3]) / atr : 0.0
 bool strongUp     = move3 >= 1.5 and volExpanding
 bool strongDn     = move3 <= -1.5 and volExpanding
@@ -412,6 +411,10 @@ var bool  swHiBroken = true
 var float swLoPrice = na
 var int   swLoIdx   = na
 var bool  swLoBroken = true
+var float swHiVol   = na
+var float swLoVol   = na
+var bool  swHiFaded = true
+var bool  swLoFaded = true
 
 var string lastStructKind  = ""
 var int    lastStructDir   = 0
@@ -947,17 +950,33 @@ if not swLoBroken and close < swLoPrice
     if conf and showStruct
         drawStructure(kind, -1, swLoIdx, swLoPrice, hv)
 
+// Fading volume (FADE): the first candle that takes out the previous swing high (low) does so on a
+// 3-candle push whose average volume is below `fadeRatio` × the volume that formed that swing.
+float pushVol = (vol + vol[1] + vol[2]) / 3
+bool fadeTop = false
+bool fadeBottom = false
+if volOk and not swHiFaded and high > swHiPrice
+    swHiFaded := true
+    fadeTop := swHiVol > 0 and pushVol < fadeRatio * swHiVol and not climaxTop
+if volOk and not swLoFaded and low < swLoPrice
+    swLoFaded := true
+    fadeBottom := swLoVol > 0 and pushVol < fadeRatio * swLoVol and not climaxBottom
+
 // 5) Swing confirmation -> liquidity levels (a swing is known only `swingLen` candles later)
 if ph
     swHiPrice := high[swingLen]
     swHiIdx := bar_index - swingLen
     swHiBroken := false
+    swHiVol := (vol[swingLen - 1] + vol[swingLen] + vol[swingLen + 1]) / 3
+    swHiFaded := false
     liqs.push(Liq.new(swHiPrice, swHiIdx, 1))
     trimSide(liqs, 1, MAX_TRACKED)
 if pl
     swLoPrice := low[swingLen]
     swLoIdx := bar_index - swingLen
     swLoBroken := false
+    swLoVol := (vol[swingLen - 1] + vol[swingLen] + vol[swingLen + 1]) / 3
+    swLoFaded := false
     liqs.push(Liq.new(swLoPrice, swLoIdx, -1))
     trimSide(liqs, -1, MAX_TRACKED)
 
@@ -1117,9 +1136,9 @@ if conf and volOk
     else if fvgHvNew
         ev := "Fair value gap created on high volume"
     else if climaxTop or climaxBottom
-        ev := "Volume climax after an extended " + (climaxTop ? "rise" : "fall") + " (possible exhaustion)"
+        ev := "Volume climax with rejection after an extended " + (climaxTop ? "rise" : "fall")
     else if fadeTop or fadeBottom
-        ev := "New " + (fadeTop ? "high" : "low") + " on fading volume (possible exhaustion)"
+        ev := "Previous swing " + (fadeTop ? "high" : "low") + " taken on fading volume"
     else if (strongUp and not strongUp[1]) or (strongDn and not strongDn[1])
         ev := "Strong " + (strongUp ? "rise" : "fall") + " with expanding volume"
     if ev != ""
@@ -1159,12 +1178,12 @@ if drawBubble and bubbleText != "None" and strengthLevel >= textMinLevel
     if bubbleLabels.size() > MAX_BUB_LABELS
         label.delete(bubbleLabels.shift())
 
-// Exhaustion markers (interpretation): climax = spike + rejection after an extended move;
-// fading = new extreme on contracting volume.
+// Volume behaviour markers (descriptions, not signals): EXH = spike + rejection after an extended
+// move; FADE = previous swing taken on clearly lower volume than the move that formed it.
 plotshape(showExh and conf and climaxTop, "Volume climax at high", shape.xcross, location.abovebar, C_EXH, size = size.tiny, text = "EXH", textcolor = C_EXH, display = display.pane)
 plotshape(showExh and conf and climaxBottom, "Volume climax at low", shape.xcross, location.belowbar, C_EXH, size = size.tiny, text = "EXH", textcolor = C_EXH, display = display.pane)
-plotshape(showExh and conf and fadeTop, "New high on fading volume", shape.diamond, location.abovebar, C_NEUTRAL, size = size.tiny, text = "FADE", textcolor = C_NEUTRAL, display = display.pane)
-plotshape(showExh and conf and fadeBottom, "New low on fading volume", shape.diamond, location.belowbar, C_NEUTRAL, size = size.tiny, text = "FADE", textcolor = C_NEUTRAL, display = display.pane)
+plotshape(showExh and conf and fadeTop, "Swing high taken on fading volume", shape.diamond, location.abovebar, C_NEUTRAL, size = size.tiny, text = "FADE", textcolor = C_NEUTRAL, display = display.pane)
+plotshape(showExh and conf and fadeBottom, "Swing low taken on fading volume", shape.diamond, location.belowbar, C_NEUTRAL, size = size.tiny, text = "FADE", textcolor = C_NEUTRAL, display = display.pane)
 
 // ═════════════════════════════════════════ Live zones (redrawn on the last candle) ═════════════════════════════════════════
 var array<box>   zoneBoxes = array.new<box>()
@@ -1423,4 +1442,4 @@ alertcondition(conf and okDn, "SELL SETUP", "Clarity SMC: SELL SETUP confirmed o
 alertcondition(conf and (sweepUpNow or sweepDnNow), "Liquidity sweep", "Clarity SMC: liquidity sweep on {{ticker}} ({{interval}})")
 alertcondition(conf and (mssUpNow or mssDnNow), "Market structure shift", "Clarity SMC: MSS on {{ticker}} ({{interval}})")
 alertcondition(conf and isSpike, "High volume spike", "Clarity SMC: statistically significant volume spike on {{ticker}} ({{interval}})")
-alertcondition(conf and (climaxTop or climaxBottom or fadeTop or fadeBottom), "Volume exhaustion", "Clarity SMC: possible volume exhaustion on {{ticker}} ({{interval}})")
+alertcondition(conf and (climaxTop or climaxBottom or fadeTop or fadeBottom), "Volume exhaustion", "Clarity SMC: volume climax or fading volume at a swing on {{ticker}} ({{interval}})")

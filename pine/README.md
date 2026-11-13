@@ -40,8 +40,8 @@ feature reports **No volume data** instead of guessing.
 | Bullish / bearish volume | Share of volume on bullish vs bearish candles over 20 candles (close vs open; ties use the previous close) | Candle direction, **not** order-flow delta. Real buyer and seller volume is not available from candles. |
 | Money flow | `Σ(close-location × volume) / Σ volume` over 20 candles. Close-location = `((close − low) − (high − close)) / (high − low)`, from −1 to +1 | Chaikin-style money flow. |
 | Accumulation-like / distribution-like | Money flow ≥ +0.05 (or ≤ −0.05) while price moved ≤ 1.5 ATR over the same 20 candles | An interpretation, labelled as such. |
-| Volume climax (**EXH**) | High-volume spike at the highest high (or lowest low) of the last 10 candles, after a move of ≥ 3 ATR, with a rejection wick ≥ 40% of the range or a close in the opposite half | Possible exhaustion, not a reversal signal. |
-| Fading volume (**FADE**) | New 10-candle high (low) while volume is contracting and relative volume < 1.0× | Decreasing participation at an extreme. |
+| Volume climax (**EXH**) | High-volume spike at the highest high (or lowest low) of the last 10 candles, after a move of ≥ 3 ATR, with a rejection wick ≥ 40% of the range or a close in the opposite half | A description of volume, not a reversal signal (see *Measured results*). |
+| Fading volume (**FADE**) | The first candle that takes out the previous **swing** high (low), when the average volume of that 3-candle push is below 0.5× the average volume of the 3 candles that formed the swing | Classic volume divergence: the level is taken with clearly less participation than built it. A description, not a reversal signal. |
 
 **Why logs?** I measured gold futures volume (COMEX GC, 1m / 5m / 15m / 1h). A z-score on raw volume
 marked 4–5% of candles as Extreme, and spikes clustered at every session open. With the default
@@ -91,7 +91,7 @@ dashboard. Choose **Exchange volume** for futures such as `COMEX:GC1!`.
 | Order block | Spike anywhere in the impulse leg from the block to the break; spike when price returns to the block |
 | Fair value gap | Spike on the displacement candle that created the gap; spike when price trades back into the gap |
 | Strong move | Price moved ≥ 1.5 ATR in 3 candles with expanding volume |
-| Exhaustion | EXH and FADE markers above |
+| Volume climax / fading volume | EXH and FADE markers above (off by default) |
 
 The latest of these appears as **Last Volume Event** in the detailed dashboard.
 
@@ -198,8 +198,8 @@ Every value has a tooltip explaining how it was calculated. Hover *Confirmation 
 
 | Group | Inputs |
 | --- | --- |
-| 1 · Display | Volume bubbles, liquidity, BOS / MSS, order blocks, fair value gaps, setup labels, trade lines, exhaustion markers, dashboard |
-| 2 · Volume analysis | Volume average period, relative volume baseline, sessions for time-of-day baseline, relative volume threshold, standard deviation multiplier (spike / extreme), low volume threshold, short volume average, volume flow period, money flow threshold, exhaustion lookback and minimum move, volume data type |
+| 1 · Display | Volume bubbles, liquidity, BOS / MSS, order blocks, fair value gaps, setup labels, trade lines, EXH / FADE markers (off by default), dashboard |
+| 2 · Volume analysis | Volume average period, relative volume baseline, sessions for time-of-day baseline, relative volume threshold, standard deviation multiplier (spike / extreme), low volume threshold, short volume average, volume flow period, money flow threshold, exhaustion lookback and minimum move, fading volume ratio, volume data type |
 | 3 · Volume bubbles | Minimum relative volume, scaling, largest size, placement, minimum bars between bubbles, value text, value strength, transparency, bullish / bearish / extreme colours |
 | 4 · Setup confirmations | The four ICT triggers, required checks (0–4) |
 | 5 · Stop loss and take profit | Buffer type and size (ATR / price / ticks), spread allowance, minimum / maximum stop distance, take profit method, three risk multiples, ICT minimum target distance, equal highs / lows tolerance, trades kept, tracking limit, label offset and stagger |
@@ -215,13 +215,27 @@ Every value has a tooltip explaining how it was calculated. Hover *Confirmation 
 | 15 minute | 4–5 | Defaults. |
 | 1 hour | 3–5 | Defaults; consider a maximum stop distance of 2.5 ATR. |
 
+## Measured results on gold (what the indicator can and cannot tell you)
+
+These were measured on COMEX gold futures (GC) 1m, 5m, 15m and 1h data, using a line-by-line
+JavaScript port of this script. Its structure, swing, sweep and order-block output is identical to
+the independently tested web engine. The data was 5 days (1m), 60 days (5m, 15m) and 2 years (1h).
+Spread and commissions are not included.
+
+| Question | Result |
+| --- | --- |
+| How often do the markers appear? | Statistical volume spikes on 2–5% of candles; setups about 10–16 per 1,000 candles; bubbles on 11–17% of candles at the 1.5× default (raise *Minimum relative volume for a bubble* to 2.0 for fewer) |
+| Do EXH / FADE predict reversals? | **No.** 10 and 20 candles later, price had reversed in 44–52% of cases, the same as after any new 10-candle high or low (47–51%). This is why they are off by default and described as volume behaviour, not signals. |
+| Stop distance | Median 1.6–2.0 ATR. More than half of all ICT triggers are rejected because their stop would be wider than 3 ATR. |
+| Setup outcomes (stop vs take profit, whichever was touched first) | Mixed: from −0.41R to +0.33R per trade depending on timeframe and target (74–184 setups per sample). **There was no consistent edge.** Setups mark measurable confluence; they are not a profitable system on their own. |
+
 ## Alerts
 
 - **BUY SETUP** and **SELL SETUP** (confirmed only)
 - **Liquidity sweep**
 - **Market structure shift**
 - **High volume spike**
-- **Volume exhaustion**
+- **Volume exhaustion** (volume climax or fading volume at a swing)
 
 Confirmed setups also send an `alert()` message containing entry, stop loss and all three targets.
 To receive it, create an alert with **Any alert() function call**.
