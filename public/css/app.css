@@ -574,6 +574,37 @@ button:focus-visible, input:focus-visible {
 .text-btn { color: var(--accent); font-weight: 600; font-size: 12px; padding: 4px 0; }
 .text-btn:hover { text-decoration: underline; }
 
+/* ---------- TradingView view ---------- */
+.tv-panel {
+  position: absolute;
+  inset: 0;
+  z-index: 9;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+.tv-panel[hidden] { display: none; }
+.tv-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.tv-title { font-size: 12px; font-weight: 600; color: var(--muted); }
+.tv-picks { display: flex; gap: 2px; padding: 2px; border: 1px solid var(--border); border-radius: 7px; }
+.tv-picks button { height: 24px; padding: 0 10px; border-radius: 5px; font-size: 12px; font-weight: 600; color: var(--muted); }
+.tv-picks button:hover { color: var(--text); background: var(--hover); }
+.tv-picks button[aria-pressed="true"] { color: var(--text-strong); background: var(--active); }
+#tvClose { margin-left: auto; }
+.tv-mount { flex: 1; min-height: 0; }
+.tv-mount .tradingview-widget-container,
+.tv-mount .tradingview-widget-container__widget { height: 100%; width: 100%; }
+.tool-btn[aria-pressed="true"] { background: var(--active); border-color: var(--accent); }
+.stage.tv-on .legend, .stage.tv-on .dash, .stage.tv-on .key { display: none; }
+
 /* ---------- Small screens ---------- */
 @media (max-width: 720px) {
   .topbar { padding: 8px 12px; gap: 8px; }
@@ -592,6 +623,7 @@ button:focus-visible, input:focus-visible {
   .status-disclaimer { display: none; }
   .status-updated { margin-left: auto; }
   .key { bottom: 34px; left: 44px; }
+  .tv-title { display: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {

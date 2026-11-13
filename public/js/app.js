@@ -83,6 +83,11 @@ const state = {
   catalog: FALLBACK_CATALOG,
   precision: 2,
   lastUpdate: null,
+  stream: null,
+  lastTickAt: 0,
+  pollSoonTimer: null,
+  renderQueued: false,
+  okFetch: true,
 };
 
 // ---------- Theme ----------
@@ -200,6 +205,7 @@ function paintVolume() {
 async function load() {
   const token = ++state.loadToken;
   clearTimeout(state.pollTimer);
+  closeStream();
   showLoading(state.bars.length ? 'overlay' : 'full', 'Loading market data…');
   const slow = setTimeout(() => {
     if (token === state.loadToken) els.loadingText.textContent = 'Waking up the server… free hosting can take up to a minute on the first visit.';
@@ -209,6 +215,7 @@ async function load() {
     if (token !== state.loadToken) return;
     applyData(data, true);
     hideLoading();
+    openStream();
     if (data.notice) toast(data.notice, 6000);
   } catch (err) {
     if (token !== state.loadToken) return;
@@ -228,8 +235,9 @@ function applyData(data, reset) {
   state.intervalSec = data.intervalSec;
   state.lastBarOpen = data.lastBarOpen !== false;
   const sourceChanged = state.meta && state.meta.source !== data.source;
+  const { bars: _bars, ...meta } = data;
   if (reset || sourceChanged || !mergeBars(incoming)) {
-    state.meta = data;
+    state.meta = meta;
     state.bars = incoming;
     state.closedCount = -1;
     shiftTime = data.intervalSec < 86400;
@@ -247,11 +255,12 @@ function applyData(data, reset) {
     chart.timeScale().setVisibleLogicalRange({ from: Math.max(0, n - show), to: n - 1 + pad });
     renderHeader();
   } else {
-    state.meta = { ...state.meta, serverTime: data.serverTime };
+    state.meta = meta; // fresh session state and price age
     recompute(false);
   }
   state.lastUpdate = Date.now();
-  updateStatus(true);
+  state.okFetch = true;
+  updateStatus();
   updateLegend();
 }
 
@@ -262,7 +271,8 @@ function mergeBars(incoming) {
   const start = incoming.findIndex((b) => b.time === lastT);
   if (start < 0) return false;
   const tail = incoming.slice(start);
-  cur[cur.length - 1] = tail[0];
+  cur[cur.length - 1] = mergeLive(cur[cur.length - 1], tail[0]);
+  tail[0] = cur[cur.length - 1];
   for (let k = 1; k < tail.length; k++) cur.push(tail[k]);
   for (let k = 0; k < tail.length; k++) {
     const i = cur.length - tail.length + k;
@@ -321,8 +331,86 @@ function avoidRects() {
 
 function schedulePoll() {
   clearTimeout(state.pollTimer);
-  const ms = prefs.tf === '5m' ? 10000 : prefs.tf === '15m' || prefs.tf === '1h' ? 15000 : 30000;
+  let ms = prefs.tf === '5m' ? 10000 : prefs.tf === '15m' || prefs.tf === '1h' ? 15000 : 30000;
+  // Binance streams the full candle (price and volume), so polling is only a safety net there.
+  if (state.meta?.source === 'binance' && streamFresh()) ms = 60000;
   state.pollTimer = setTimeout(poll, ms);
+}
+
+// ---------- Real-time stream ----------
+// Crypto: Binance pushes the exchange's own forming candle (OHLC + volume) about every second.
+// Yahoo markets: Yahoo pushes each traded price; it updates the forming candle's close/high/low.
+// Candle volume for Yahoo markets is never estimated from ticks — it comes from the polled candles.
+const streamFresh = () => state.lastTickAt > 0 && Date.now() - state.lastTickAt < (state.meta?.source === 'binance' ? 15000 : 120000);
+
+function openStream() {
+  closeStream();
+  const m = state.meta;
+  if (!window.EventSource || !m || (m.source !== 'binance' && m.source !== 'yahoo')) return;
+  const token = state.loadToken;
+  const es = new EventSource(`/api/stream?symbol=${encodeURIComponent(prefs.symbol)}&tf=${encodeURIComponent(prefs.tf)}`);
+  state.stream = es;
+  es.addEventListener('bar', (e) => { if (token === state.loadToken) onStreamBar(JSON.parse(e.data)); });
+  es.addEventListener('tick', (e) => { if (token === state.loadToken) onStreamTick(JSON.parse(e.data)); });
+  es.onerror = () => updateStatus();
+}
+
+function closeStream() {
+  if (state.stream) state.stream.close();
+  state.stream = null;
+  state.lastTickAt = 0;
+}
+
+function onStreamBar({ bar }) {
+  if (state.meta?.source !== 'binance' || !Array.isArray(bar)) return;
+  const b = toBar(bar);
+  const bars = state.bars;
+  const last = bars[bars.length - 1];
+  if (!last || b.time < last.time) return;
+  if (b.time === last.time) bars[bars.length - 1] = b;
+  else if (b.time === last.time + state.intervalSec) bars.push(b);
+  else { pollSoon(); return; } // a gap: reload candles instead of guessing
+  candles.update(toCandle(b));
+  if (!noVolume()) volume.update({ time: toChartTime(b.time), value: b.volume, color: volumeColor(bars.length - 1) });
+  state.lastTickAt = Date.now();
+  renderSoon();
+}
+
+function onStreamTick(t) {
+  if (state.meta?.source !== 'yahoo' || !Number.isFinite(t.price) || !Number.isFinite(t.time)) return;
+  if (t.marketHours !== 1) return; // pre/post-market trades are not part of these candles
+  const last = state.bars[state.bars.length - 1];
+  if (!last || t.time < last.time) return;
+  if (t.time >= last.time + state.intervalSec) { pollSoon(); return; } // belongs to a new candle
+  last.close = t.price;
+  last.high = Math.max(last.high, t.price);
+  last.low = Math.min(last.low, t.price);
+  candles.update(toCandle(last));
+  state.lastTickAt = Date.now();
+  renderSoon();
+}
+
+// Keep live updates from the stream when a poll returns the same forming candle.
+function mergeLive(cur, rest) {
+  if (!cur || cur.time !== rest.time || !streamFresh()) return rest;
+  if (state.meta?.source === 'binance') return cur; // the stream is newer than the polled copy
+  return { ...rest, high: Math.max(rest.high, cur.high), low: Math.min(rest.low, cur.low), close: cur.close };
+}
+
+function pollSoon() {
+  if (state.pollSoonTimer) return;
+  state.pollSoonTimer = setTimeout(() => { state.pollSoonTimer = null; poll(); }, 1500);
+}
+
+function renderSoon() {
+  if (state.renderQueued) return;
+  state.renderQueued = true;
+  requestAnimationFrame(() => {
+    state.renderQueued = false;
+    recompute(false);
+    updateLegend();
+    updateStatus();
+  });
 }
 
 async function poll() {
@@ -334,7 +422,8 @@ async function poll() {
     applyData(data, false);
   } catch {
     if (token !== state.loadToken) return;
-    updateStatus(false);
+    state.okFetch = false;
+    updateStatus();
   }
   schedulePoll();
 }
@@ -481,15 +570,23 @@ function setStatus(kind, text) {
   els.statusText.textContent = text;
 }
 
-function updateStatus(ok) {
+// The status line reports what is measured: streaming now, delayed by a measured amount, or closed.
+function updateStatus() {
   const m = state.meta;
   if (!m) return;
-  if (!ok) setStatus('warn', `Reconnecting to ${m.sourceLabel}…`);
+  const src = m.sourceLabel;
+  if (tvOn) setStatus('live', 'TradingView chart · prices, data and delays as shown by TradingView');
   else if (m.source === 'demo') setStatus('warn', 'Demo data — live feed unavailable');
-  else if (m.delayed) setStatus('live', `${m.sourceLabel} · may be delayed`);
-  else setStatus('live', `Live · ${m.sourceLabel}`);
-  if (state.lastUpdate) els.statusUpdated.textContent = `Updated ${clockFmt.format(new Date(state.lastUpdate))}`;
+  else if (!state.okFetch && !streamFresh()) setStatus('warn', `Reconnecting to ${src}…`);
+  else if (streamFresh()) setStatus('live', `Real-time · ${src} stream`);
+  else if (m.source === 'yahoo' && m.lastBarOpen === false) setStatus('', `Market closed · ${src}`);
+  else if (m.source === 'yahoo' && m.priceAgeSec >= 120) setStatus('warn', `${src} · delayed ${Math.round(m.priceAgeSec / 60)} min by the exchange feed`);
+  else if (m.source === 'yahoo') setStatus('live', `${src} · updates every ${prefs.tf === '5m' ? 10 : prefs.tf === '15m' || prefs.tf === '1h' ? 15 : 30} s`);
+  else setStatus('live', `Live · ${src}`);
+  const last = Math.max(state.lastUpdate || 0, state.lastTickAt || 0);
+  if (last) els.statusUpdated.textContent = `Updated ${clockFmt.format(new Date(last))}`;
 }
+setInterval(updateStatus, 5000);
 
 function showLoading(mode, text) {
   els.loading.classList.remove('hide');
@@ -524,6 +621,7 @@ els.tfGroup.addEventListener('click', (e) => {
   syncUrl();
   renderTimeframes();
   load();
+  if (tvOn) renderTradingView();
 });
 
 function syncUrl() {
@@ -595,6 +693,7 @@ function chooseSymbol(sym) {
   syncUrl();
   els.symbolLabel.textContent = sym;
   load();
+  if (tvOn) renderTradingView();
 }
 
 els.symbolBtn.addEventListener('click', (e) => {
@@ -748,6 +847,79 @@ window.addEventListener('resize', () => {
   pushOverlay();
 });
 
+// ---------- TradingView view ----------
+// TradingView's official embeddable chart: TradingView's own prices and data, shown by TradingView.
+// (TradingView has no public data API, so its data is used through its widget, not copied.)
+const TV_SYMBOLS = {
+  BTCUSDT: 'BINANCE:BTCUSDT', ETHUSDT: 'BINANCE:ETHUSDT', SOLUSDT: 'BINANCE:SOLUSDT', BNBUSDT: 'BINANCE:BNBUSDT',
+  XRPUSDT: 'BINANCE:XRPUSDT', DOGEUSDT: 'BINANCE:DOGEUSDT',
+  AAPL: 'NASDAQ:AAPL', NVDA: 'NASDAQ:NVDA', TSLA: 'NASDAQ:TSLA', MSFT: 'NASDAQ:MSFT', AMZN: 'NASDAQ:AMZN',
+  SPY: 'AMEX:SPY', QQQ: 'NASDAQ:QQQ', '^GSPC': 'SP:SPX', '^NDX': 'NASDAQ:NDX',
+  'EURUSD=X': 'FX:EURUSD', 'GBPUSD=X': 'FX:GBPUSD', 'USDJPY=X': 'FX:USDJPY',
+  'GC=F': 'COMEX:GC1!', 'SI=F': 'COMEX:SI1!', 'CL=F': 'NYMEX:CL1!',
+};
+const TV_INTERVAL = { '5m': '5', '15m': '15', '1h': '60', '4h': '240', '1d': 'D' };
+const tvEls = {
+  btn: $('tvBtn'), panel: $('tvPanel'), mount: $('tvMount'), close: $('tvClose'),
+  picks: document.querySelector('.tv-picks'),
+};
+let tvOn = false;
+let tvPick = 'current';
+
+function tvSymbol(sym) {
+  if (TV_SYMBOLS[sym]) return TV_SYMBOLS[sym];
+  if (/^[A-Z0-9]+(USDT|USDC|FDUSD|BTC|ETH)$/.test(sym)) return `BINANCE:${sym}`;
+  return sym.replace(/=X$/, '').replace(/^\^/, '');
+}
+
+function renderTradingView() {
+  tvEls.mount.textContent = '';
+  if (!tvOn) return;
+  const box = document.createElement('div');
+  box.className = 'tradingview-widget-container';
+  const inner = document.createElement('div');
+  inner.className = 'tradingview-widget-container__widget';
+  const script = document.createElement('script');
+  script.src = 'https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js';
+  script.async = true;
+  let tz = 'Etc/UTC';
+  try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || tz; } catch { /* default */ }
+  script.textContent = JSON.stringify({
+    autosize: true,
+    symbol: tvPick === 'current' ? tvSymbol(prefs.symbol) : tvPick,
+    interval: TV_INTERVAL[prefs.tf] || '60',
+    timezone: tz,
+    theme: theme.name,
+    style: '1',
+    locale: 'en',
+    allow_symbol_change: true,
+    save_image: false,
+    calendar: false,
+    support_host: 'https://www.tradingview.com',
+  });
+  box.append(inner, script);
+  tvEls.mount.append(box);
+}
+
+function setTradingView(on) {
+  tvOn = on;
+  tvEls.panel.hidden = !on;
+  els.stage.classList.toggle('tv-on', on);
+  tvEls.btn.setAttribute('aria-pressed', String(on));
+  renderTradingView();
+  updateStatus();
+}
+
+tvEls.btn.addEventListener('click', () => setTradingView(!tvOn));
+tvEls.close.addEventListener('click', () => setTradingView(false));
+tvEls.picks.addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-tv]');
+  if (!b) return;
+  tvPick = b.dataset.tv;
+  for (const x of tvEls.picks.querySelectorAll('button')) x.setAttribute('aria-pressed', String(x === b));
+  renderTradingView();
+});
+
 // ---------- Key + theme ----------
 function applyKey() {
   els.keyBody.hidden = !prefs.keyOpen;
@@ -764,6 +936,7 @@ els.themeBtn.addEventListener('click', () => {
   prefs.theme = theme.name === 'dark' ? 'light' : 'dark';
   savePrefs();
   applyTheme();
+  renderTradingView();
 });
 if (window.matchMedia) {
   window.matchMedia('(prefers-color-scheme: light)').addEventListener?.('change', () => {

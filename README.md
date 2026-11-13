@@ -70,13 +70,26 @@ keeps the symbol and timeframe (`/?symbol=ETHUSDT&tf=4h`) so a view can be share
 
 ## Data
 
-| Market | Source | Notes |
+| Market | Candles | Live updates |
 | --- | --- | --- |
-| Crypto (`BTCUSDT`, any `…USDT` pair) | Binance public market data, Kraken fallback | Live, polled every 10–30 s |
-| Stocks, ETFs, indices, forex, commodities | Yahoo Finance chart API | May be delayed; forex has no volume, so volume features show N/A |
+| Crypto (`BTCUSDT`, any `…USDT` pair) | Binance public market data (Kraken fallback) | **Real-time**: Binance streams the forming candle (price and volume) about every second |
+| Forex, stocks, ETFs, indices | Yahoo Finance chart API | **Real-time** while the market is open: Yahoo Finance streams every traded price (measured ≈1.5 s for forex) |
+| Futures (gold `GC=F`, silver, oil) | Yahoo Finance chart API | **Delayed 10 minutes** by the exchange feed (measured); the status bar shows the measured delay |
+
+The status bar always reports what is measured: *Real-time · … stream*, *delayed N min*, or *Market closed*.
+Streamed ticks update a candle's price only; candle volume for Yahoo markets always comes from Yahoo's
+candles and is never estimated. Forex has no volume, so volume features show N/A.
 
 If every feed is unreachable the server returns clearly labelled **Demo data** so the app still works.
 No API keys are required.
+
+### TradingView
+
+The **TradingView** button shows the current market on TradingView's official embedded chart: prices,
+data and real-time status come from TradingView. It includes one-click **spot gold (OANDA:XAUUSD)**,
+which Yahoo does not offer in real time. TradingView has no public data API and its terms do not allow
+copying its data, so the Clarity analysis runs on TradingView data through the Pine Script version
+([`pine/clarity_smc.pine`](pine/clarity_smc.pine)) instead.
 
 ## Run locally
 

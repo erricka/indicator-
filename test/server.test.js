@@ -30,6 +30,7 @@ test('serves the app shell with a build id and security headers', async () => {
   assert.match(html, /<title>Clarity SMC Chart<\/title>/);
   assert.doesNotMatch(html, /__BUILD__/);
   assert.match(res.headers.get('content-security-policy'), /default-src 'self'/);
+  assert.match(res.headers.get('content-security-policy'), /frame-src [^;]*tradingview-widget\.com/);
   assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
   const etag = res.headers.get('etag');
   const again = await fetch(`${base}/`, { headers: { 'If-None-Match': etag } });
@@ -55,6 +56,10 @@ test('health check, validation and path traversal', async () => {
   assert.equal((await fetch(`${base}/%E0%A4%A`)).status, 400, 'malformed escape is a client error');
   const trav = await fetch(`${base}/%2e%2e/server.js`);
   assert.ok([403, 404].includes(trav.status));
+  const badStream = await fetch(`${base}/api/stream?symbol=${encodeURIComponent('<x>')}&tf=1h`);
+  assert.equal(badStream.status, 400);
+  const badTf = await fetch(`${base}/api/stream?symbol=BTCUSDT&tf=9m`);
+  assert.equal(badTf.status, 400);
   const sym = await (await fetch(`${base}/api/symbols`)).json();
   assert.ok(sym.catalog.length >= 4);
 });

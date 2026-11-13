@@ -5,6 +5,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
+import { YahooHub, BinanceHub } from './lib/realtime.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(ROOT, 'public');
@@ -191,10 +192,15 @@ async function fromYahoo(sym, tf) {
       if (agg) bars = aggregate(bars, agg);
       if (!bars.length) throw new Error('Yahoo: empty');
       return {
-        source: 'yahoo', sourceLabel: 'Yahoo Finance', delayed: true,
+        source: 'yahoo', sourceLabel: 'Yahoo Finance',
         bars: bars.slice(-MAX_BARS),
         currency: r.meta?.currency || null,
         session: r.meta?.currentTradingPeriod?.regular || null,
+        // Yahoo's canonical ticker (e.g. USDJPY=X is streamed as JPY=X) and the time of its latest price.
+        streamSymbol: r.meta?.symbol || sym.symbol,
+        instrumentType: r.meta?.instrumentType || null,
+        exchange: r.meta?.fullExchangeName || null,
+        marketTime: Number.isFinite(r.meta?.regularMarketTime) ? r.meta.regularMarketTime : null,
       };
     } catch (err) { lastErr = err; }
   }
@@ -232,7 +238,9 @@ function withOpenFlag(out, tf) {
   const last = out.bars[out.bars.length - 1];
   const { session, ...rest } = out;
   const lastBarOpen = session ? nowS >= session.start && nowS < session.end : last[0] + tf.sec > nowS;
-  return { ...rest, lastBarOpen };
+  // Measured age of the newest price while the market is open (e.g. CME futures on Yahoo are ~10 min old).
+  const priceAgeSec = lastBarOpen && Number.isFinite(rest.marketTime) ? Math.max(0, Math.round(nowS - rest.marketTime)) : null;
+  return { ...rest, lastBarOpen, priceAgeSec };
 }
 
 const cache = new Map();
@@ -275,6 +283,56 @@ export async function getCandles(rawSymbol, tfKey) {
   return promise;
 }
 
+// ---------- Real-time stream (Server-Sent Events) ----------
+const yahooHub = new YahooHub({ log: (m) => console.warn(m) });
+const binanceHub = new BinanceHub({ log: (m) => console.warn(m) });
+const MAX_STREAMS = 300;
+let openStreams = 0;
+
+async function handleStream(req, res, url) {
+  const sym = resolveSymbol(url.searchParams.get('symbol'));
+  const tfKey = url.searchParams.get('tf') || '1h';
+  const tf = TIMEFRAMES[tfKey];
+  if (!sym || !tf) return sendJson(res, 400, { error: 'Invalid symbol or timeframe' });
+  if (openStreams >= MAX_STREAMS) return sendJson(res, 503, { error: 'Too many live connections' });
+  let feed = 'binance';
+  let streamSymbol = sym.symbol;
+  if (sym.kind !== 'crypto') {
+    feed = 'yahoo';
+    try {
+      streamSymbol = (await getCandles(sym.symbol, tfKey)).streamSymbol || sym.symbol;
+    } catch { /* stream the requested ticker */ }
+  }
+  if (res.destroyed || req.destroyed) return undefined;
+  openStreams++;
+  res.writeHead(200, {
+    ...SECURITY_HEADERS,
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-store',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  const write = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  res.write('retry: 5000\n\n');
+  write('ready', { feed, symbol: streamSymbol });
+  const unsubscribe = feed === 'binance'
+    ? binanceHub.subscribe(sym.symbol, tf.binance, (m) => write('bar', m))
+    // Only the traded price and its exchange time are forwarded; volume stays with the candles.
+    : yahooHub.subscribe(streamSymbol, (t) => write('tick', { price: t.price, time: t.time / 1000, marketHours: t.marketHours }));
+  const ping = setInterval(() => res.write(': ping\n\n'), 20000);
+  let closed = false;
+  const done = () => {
+    if (closed) return;
+    closed = true;
+    clearInterval(ping);
+    unsubscribe();
+    openStreams--;
+  };
+  req.on('close', done);
+  res.on('error', done);
+  return undefined;
+}
+
 // ---------- HTTP ----------
 
 const TYPES = {
@@ -295,7 +353,8 @@ const SECURITY_HEADERS = {
   'X-Frame-Options': 'SAMEORIGIN',
   'Content-Security-Policy': [
     "default-src 'self'",
-    "script-src 'self'",
+    "script-src 'self' https://s3.tradingview.com",
+    "frame-src https://s.tradingview.com https://www.tradingview.com https://www.tradingview-widget.com",
     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
     "font-src 'self' https://fonts.gstatic.com",
     "img-src 'self' data:",
@@ -362,6 +421,7 @@ export function createServer() {
       if (pathname === '/api/symbols') {
         return sendJson(res, 200, { catalog: CATALOG, timeframes: Object.keys(TIMEFRAMES) }, { 'Cache-Control': 'public, max-age=3600' });
       }
+      if (pathname === '/api/stream') return handleStream(req, res, url);
       if (pathname === '/api/candles') {
         const data = await getCandles(url.searchParams.get('symbol') || 'BTCUSDT', url.searchParams.get('tf') || '1h');
         return sendJson(res, 200, data);

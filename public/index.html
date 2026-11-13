@@ -44,6 +44,10 @@
       </div>
 
       <div class="topbar-actions">
+        <button id="tvBtn" class="tool-btn" aria-pressed="false" title="Show this market on TradingView's own chart and data">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 15l5-6 3 3 6-7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span>TradingView</span>
+        </button>
         <button id="layersBtn" class="tool-btn" aria-haspopup="dialog" aria-expanded="false">
           <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3 2.5 7 10 11l7.5-4L10 3Z M2.5 10.5 10 14.5l7.5-4 M2.5 13.8 10 17.8l7.5-4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
           <span>Layers</span>
@@ -56,6 +60,18 @@
 
     <main class="stage">
       <div id="chart" class="chart" aria-label="Price chart"></div>
+
+      <section id="tvPanel" class="tv-panel" aria-label="TradingView chart" hidden>
+        <div class="tv-bar">
+          <span class="tv-title">TradingView chart · prices and data by TradingView</span>
+          <div class="tv-picks" role="group" aria-label="TradingView symbol">
+            <button type="button" data-tv="current" aria-pressed="true">This market</button>
+            <button type="button" data-tv="OANDA:XAUUSD" aria-pressed="false">Spot gold XAUUSD</button>
+          </div>
+          <button type="button" id="tvClose" class="text-btn">Back to Clarity chart</button>
+        </div>
+        <div id="tvMount" class="tv-mount"></div>
+      </section>
 
       <div class="legend" id="legend" aria-live="off">
         <div class="legend-row">
