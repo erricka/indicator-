@@ -5,7 +5,7 @@ order blocks, fair value gaps and volume, and highlights a **BUY SETUP / SELL SE
 several confirmations line up. The goal is to understand the market in 3–5 seconds, without a
 chart full of indicators.
 
-- **Web app** — runs on a free Render web service with live crypto, stock, index, forex and commodity data.
+- **Web app** — live at **https://clarity-smc.onrender.com** (free Render web service) with crypto, stock, index, forex and commodity data.
 - **TradingView version** — the same rules as a Pine Script v6 indicator in [`pine/clarity_smc.pine`](pine/clarity_smc.pine).
 
 > Setups highlight confluence only. They are not financial advice and outcomes are never guaranteed.
