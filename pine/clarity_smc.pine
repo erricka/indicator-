@@ -25,7 +25,7 @@
 
 //@version=6
 indicator("Clarity SMC — ICT + Volume Analysis", "Clarity SMC", overlay = true,
-     max_boxes_count = 100, max_lines_count = 200, max_labels_count = 500, max_bars_back = 500)
+     max_boxes_count = 250, max_lines_count = 200, max_labels_count = 500, max_bars_back = 500)
 
 // ═════════════════════════════════════════ Inputs ═════════════════════════════════════════
 G1 = "1 · Display"
@@ -71,8 +71,8 @@ bubbleMax     = input.string("Huge", "Largest bubble size", options = ["Normal",
 bubblePlace   = input.string("Candle center", "Bubble placement", options = ["Candle center", "Beside candle"], group = G3, display = display.none)
 bubbleGap     = input.int(1, "Minimum bars between bubbles", minval = 0, maxval = 10, group = G3, display = display.none,
      tooltip = "A bubble within this many bars of the previous one is skipped unless it is larger or an extreme spike. Reduces overlap.")
-bubbleText    = input.string("Relative volume", "Bubble value", options = ["Relative volume", "Volume", "Both", "None"], group = G3, display = display.none)
-bubbleTextMin = input.string("High", "Show values from strength", options = ["Elevated", "High", "Extreme"], group = G3, display = display.none)
+bubbleText    = input.string("Volume", "Bubble value", options = ["Relative volume", "Volume", "Both", "None"], group = G3, display = display.none)
+bubbleTextMin = input.string("Elevated", "Show values from strength", options = ["Elevated", "High", "Extreme"], group = G3, display = display.none)
 bubbleTransp  = input.int(65, "Bubble transparency", minval = 0, maxval = 95, group = G3, display = display.none)
 colBubBull    = input.color(#22C55E, "Bullish candle bubble", group = G3, display = display.none)
 colBubBear    = input.color(#EF4444, "Bearish candle bubble", group = G3, display = display.none)
@@ -118,6 +118,28 @@ G7 = "7 · Dashboard"
 dashMode = input.string("Standard", "Dashboard detail", options = ["Standard", "Detailed"], group = G7, display = display.none)
 dashPos  = input.string("Top Right", "Dashboard position", options = ["Top Right", "Bottom Right", "Top Left", "Bottom Left"], group = G7, display = display.none)
 dashSize = input.string("Small", "Dashboard text size", options = ["Tiny", "Small", "Normal"], group = G7, display = display.none)
+
+G8 = "8 · Volume profile (where trading happened)"
+showVP  = input.bool(true, "Volume profile", group = G8, display = display.none,
+     tooltip = "Volume traded at each price over the last candles, with the point of control (most traded price) and the value area. It shows where trading HAPPENED, not where orders are waiting: no candle data can show resting orders. Estimated by spreading each candle's volume evenly across its high-low range; on OANDA/forex feeds this is tick volume.")
+vpBars  = input.int(150, "Profile length (candles)", minval = 20, maxval = 480, group = G8, display = display.none)
+vpRows  = input.int(30, "Profile rows", minval = 10, maxval = 80, group = G8, display = display.none)
+vpVA    = input.float(70, "Value area (% of volume)", minval = 50, maxval = 95, step = 5, group = G8, display = display.none)
+vpWidth = input.int(35, "Profile width (% of profile length)", minval = 5, maxval = 100, group = G8, display = display.none)
+vpPlace = input.string("From range start", "Profile placement", options = ["From range start", "Right of price"], group = G8, display = display.none)
+colVA   = input.color(color.new(#FACC15, 72), "Value area rows", group = G8, display = display.none)
+colVPo  = input.color(color.new(#94A3B8, 84), "Other rows", group = G8, display = display.none)
+colPOC  = input.color(#FACC15, "Point of control", group = G8, display = display.none)
+
+G9 = "9 · Key levels, sessions and EMA ribbon"
+showPD  = input.bool(true, "Previous day high / low (liquidity)", group = G9, display = display.none,
+     tooltip = "ICT treats the previous day's and week's high and low as liquidity: stop orders are likely to rest just beyond them. They are also used as targets in ICT take-profit mode.")
+showPW  = input.bool(true, "Previous week high / low (liquidity)", group = G9, display = display.none)
+showKZ  = input.bool(true, "ICT killzones (New York time)", group = G9, display = display.none,
+     tooltip = "Asia 20:00–24:00, London 02:00–05:00 and New York 07:00–10:00, New York time (daylight saving handled). Shown on 1-hour and lower charts.")
+showEMA = input.bool(true, "EMA ribbon", group = G9, display = display.none)
+emaFastLen = input.int(20, "EMA ribbon fast length", minval = 2, maxval = 200, group = G9, display = display.none)
+emaSlowLen = input.int(50, "EMA ribbon slow length", minval = 3, maxval = 400, group = G9, display = display.none)
 
 // ═════════════════════════════════════════ Constants ═════════════════════════════════════════
 int   EMA_LEN           = 50
@@ -242,6 +264,13 @@ float atr   = ta.atr(14)
 float ema50 = ta.ema(close, EMA_LEN)
 float recentLow  = ta.lowest(low, swingLen * 2)
 float recentHigh = ta.highest(high, swingLen * 2)
+
+// Previous day / week high and low: the [1] offset with lookahead_on is the standard
+// non-repainting way to read the previous, already closed, higher-timeframe candle.
+[pdh, pdl] = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+[pwh, pwl] = request.security(syminfo.tickerid, "W", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+float emaFast = ta.ema(close, emaFastLen)
+float emaSlow = ta.ema(close, emaSlowLen)
 
 // ─── 1. Measured volume (never invented) ───
 // `volume` is the feed's own value. Missing values count as 0 and are reported, not filled in.
@@ -590,34 +619,52 @@ stopFor(int dir, float entry, bool useSweep, int sweepIdx, bool useOb, float obL
         basis += " (widened to minimum distance)"
     [sl, basis]
 
-// ICT targets: untaken liquidity in the trade direction, equal highs/lows merged into one pool.
+// ICT targets: untaken liquidity in the trade direction (swing levels plus the previous day's and
+// week's high/low), with levels within the equal-highs/lows tolerance merged into one pool.
 ictTargets(int dir, float entry, float risk, float atrNow) =>
-    array<float> cand = array.new<float>()
+    array<float>  cp = array.new<float>()
+    array<string> cn = array.new<string>()
     for lv in liqs
         if lv.dir == dir and (lv.price - entry) * dir >= minTargetR * risk
-            cand.push(lv.price)
-    if dir > 0
-        cand.sort(order.ascending)
-    else
-        cand.sort(order.descending)
-    array<float> pools  = array.new<float>()
-    array<int>   counts = array.new<int>()
-    for p in cand
-        int last = pools.size() - 1
-        if last >= 0 and math.abs(p - pools.get(last)) <= eqTolAtr * atrNow
-            pools.set(last, dir > 0 ? math.max(p, pools.get(last)) : math.min(p, pools.get(last)))
-            counts.set(last, counts.get(last) + 1)
-        else
-            pools.push(p)
-            counts.push(1)
+            cp.push(lv.price)
+            cn.push(dir > 0 ? "buy-side liquidity" : "sell-side liquidity")
+    float pd = dir > 0 ? pdh : pdl
+    float pw = dir > 0 ? pwh : pwl
+    if not na(pd) and (pd - entry) * dir >= minTargetR * risk
+        cp.push(pd)
+        cn.push(dir > 0 ? "previous day high" : "previous day low")
+    if not na(pw) and (pw - entry) * dir >= minTargetR * risk
+        cp.push(pw)
+        cn.push(dir > 0 ? "previous week high" : "previous week low")
+    array<int> ord = cp.sort_indices(order.ascending)
+    array<float>  pools  = array.new<float>()
+    array<int>    counts = array.new<int>()
+    array<string> pname  = array.new<string>()
+    int m = ord.size()
+    if m > 0
+        for q = 0 to m - 1
+            int ix = ord.get(dir > 0 ? q : m - 1 - q)
+            float p = cp.get(ix)
+            string nm = cn.get(ix)
+            int last = pools.size() - 1
+            if last >= 0 and math.abs(p - pools.get(last)) <= eqTolAtr * atrNow
+                pools.set(last, dir > 0 ? math.max(p, pools.get(last)) : math.min(p, pools.get(last)))
+                counts.set(last, counts.get(last) + 1)
+                if str.contains(nm, "previous")
+                    pname.set(last, nm)
+            else
+                pools.push(p)
+                counts.push(1)
+                pname.push(nm)
     array<float>  tps   = array.new<float>()
     array<string> names = array.new<string>()
     int nPools = math.min(pools.size(), 3)
     if nPools > 0
         for k = 0 to nPools - 1
             tps.push(pools.get(k))
-            string kind = counts.get(k) >= 2 ? (dir > 0 ? "equal highs" : "equal lows") : (dir > 0 ? "buy-side liquidity" : "sell-side liquidity")
-            names.push(kind + (counts.get(k) >= 2 ? " (" + str.tostring(counts.get(k)) + " swings)" : ""))
+            string base = pname.get(k)
+            string kind = counts.get(k) >= 2 ? (dir > 0 ? "equal highs" : "equal lows") + (str.contains(base, "previous") ? " incl. " + base : "") : base
+            names.push(kind + (counts.get(k) >= 2 ? " (" + str.tostring(counts.get(k)) + " levels)" : ""))
     array<float> rrs = array.from(rr1, rr2, rr3)
     int i = 0
     while tps.size() < 3 and i < 3
@@ -1185,6 +1232,141 @@ plotshape(showExh and conf and climaxBottom, "Volume climax at low", shape.xcros
 plotshape(showExh and conf and fadeTop, "Swing high taken on fading volume", shape.diamond, location.abovebar, C_NEUTRAL, size = size.tiny, text = "FADE", textcolor = C_NEUTRAL, display = display.pane)
 plotshape(showExh and conf and fadeBottom, "Swing low taken on fading volume", shape.diamond, location.belowbar, C_NEUTRAL, size = size.tiny, text = "FADE", textcolor = C_NEUTRAL, display = display.pane)
 
+// ═════════════════════════════════════════ EMA ribbon and ICT killzones ═════════════════════════════════════════
+pEmaFast = plot(showEMA ? emaFast : na, "EMA ribbon fast", color = #22D3EE, linewidth = 1, display = display.pane)
+pEmaSlow = plot(showEMA ? emaSlow : na, "EMA ribbon slow", color = #F59E0B, linewidth = 1, display = display.pane)
+fill(pEmaFast, pEmaSlow, color = emaFast > emaSlow ? color.new(C_BULL, 88) : color.new(C_BEAR, 88), title = "EMA ribbon fill", display = display.pane)
+
+bool kzChart  = timeframe.isintraday and tfSec <= 3600
+bool kzAsia   = not na(time(timeframe.period, "2000-2359", "America/New_York"))
+bool kzLondon = not na(time(timeframe.period, "0200-0500", "America/New_York"))
+bool kzNY     = not na(time(timeframe.period, "0700-1000", "America/New_York"))
+string kzName = kzLondon ? "London killzone" : kzNY ? "New York killzone" : kzAsia ? "Asia session" : "Outside killzones"
+bgcolor(showKZ and kzChart ? (kzLondon ? color.new(#3B82F6, 93) : kzNY ? color.new(#A855F7, 93) : kzAsia ? color.new(#94A3B8, 95) : na) : na, title = "ICT killzones", display = display.pane)
+
+// ═════════════════════════════════════════ Previous day / week levels ═════════════════════════════════════════
+var int dayStartIdx  = 0
+var int weekStartIdx = 0
+if timeframe.change("D")
+    dayStartIdx := bar_index
+if timeframe.change("W")
+    weekStartIdx := bar_index
+var array<line>  keyLines  = array.new<line>()
+var array<label> keyLabels = array.new<label>()
+
+drawLevel(int x1, float y, string name, color c, string tip) =>
+    keyLines.push(line.new(x1, y, bar_index + EXTEND, y, color = c, width = 1))
+    keyLabels.push(label.new(bar_index + EXTEND, y, name + " " + fmtPrice(y), style = label.style_label_left, color = C_CLEAR, textcolor = c, size = size.tiny, tooltip = tip))
+
+if barstate.islast
+    for l in keyLines
+        line.delete(l)
+    for lb in keyLabels
+        label.delete(lb)
+    keyLines.clear()
+    keyLabels.clear()
+    if timeframe.isintraday
+        color cDay = color.new(chart.fg_color, 25)
+        color cWeek = color.new(chart.fg_color, 50)
+        int xd = math.max(dayStartIdx, bar_index - 4000)
+        int xw = math.max(weekStartIdx, bar_index - 4000)
+        if showPD and not na(pdh)
+            drawLevel(xd, pdh, "PDH", cDay, "Previous day high: buy-side liquidity (stops likely rest above).")
+            drawLevel(xd, pdl, "PDL", cDay, "Previous day low: sell-side liquidity (stops likely rest below).")
+        if showPW and not na(pwh)
+            drawLevel(xw, pwh, "PWH", cWeek, "Previous week high: buy-side liquidity.")
+            drawLevel(xw, pwl, "PWL", cWeek, "Previous week low: sell-side liquidity.")
+
+// ═════════════════════════════════════════ Volume profile (estimated volume at price) ═════════════════════════════════════════
+// Each candle's volume is spread evenly over the price rows its high-low range covers. The point of
+// control (POC) is the row with the most volume; the value area grows from the POC towards the larger
+// neighbouring row until it holds `vpVA` % of the volume. Shows where trading happened, not resting orders.
+var array<box> vpBoxes = array.new<box>()
+var array<line> vpLines = array.new<line>()
+var array<label> vpLabels = array.new<label>()
+var float vpPoc = na
+var float vpVah = na
+var float vpVal = na
+
+if barstate.islast
+    for bx in vpBoxes
+        box.delete(bx)
+    for l in vpLines
+        line.delete(l)
+    for lb in vpLabels
+        label.delete(lb)
+    vpBoxes.clear()
+    vpLines.clear()
+    vpLabels.clear()
+    vpPoc := na
+    vpVah := na
+    vpVal := na
+    if showVP and volOk
+        int nb = math.min(vpBars, bar_index + 1)
+        float hi = high
+        float lo = low
+        for k = 0 to nb - 1
+            hi := math.max(hi, high[k])
+            lo := math.min(lo, low[k])
+        if hi > lo
+            float rowH = (hi - lo) / vpRows
+            array<float> rows = array.new<float>(vpRows, 0.0)
+            for k = 0 to nb - 1
+                float v = nz(volume[k])
+                if v > 0
+                    float h = high[k]
+                    float l = low[k]
+                    if h <= l
+                        int b = math.min(vpRows - 1, math.max(0, math.floor((close[k] - lo) / rowH)))
+                        rows.set(b, rows.get(b) + v)
+                    else
+                        int b0 = math.min(vpRows - 1, math.max(0, math.floor((l - lo) / rowH)))
+                        int b1 = math.min(vpRows - 1, math.max(0, math.floor((h - lo) / rowH)))
+                        for b = b0 to b1
+                            float rLo = lo + b * rowH
+                            float ov = math.min(h, rLo + rowH) - math.max(l, rLo)
+                            if ov > 0
+                                rows.set(b, rows.get(b) + v * ov / (h - l))
+            float total = rows.sum()
+            float maxV = rows.max()
+            if total > 0 and maxV > 0
+                int poc = rows.indexof(maxV)
+                int up = poc
+                int dn = poc
+                float acc = maxV
+                while acc < total * vpVA / 100 and (up < vpRows - 1 or dn > 0)
+                    float nUp = up < vpRows - 1 ? rows.get(up + 1) : -1.0
+                    float nDn = dn > 0 ? rows.get(dn - 1) : -1.0
+                    if nUp >= nDn
+                        up += 1
+                        acc += nUp
+                    else
+                        dn -= 1
+                        acc += nDn
+                vpPoc := lo + (poc + 0.5) * rowH
+                vpVah := lo + (up + 1) * rowH
+                vpVal := lo + dn * rowH
+                bool right = vpPlace == "Right of price"
+                int x0 = right ? bar_index + EXTEND + 12 : bar_index - nb + 1
+                int maxW = right ? 40 : math.max(3, math.round(nb * vpWidth / 100.0))
+                for b = 0 to vpRows - 1
+                    float v = rows.get(b)
+                    if v > 0
+                        int w = math.max(1, math.round(maxW * v / maxV))
+                        bool inVA = b >= dn and b <= up
+                        vpBoxes.push(box.new(x0, lo + (b + 1) * rowH, x0 + w, lo + b * rowH, border_color = C_CLEAR, bgcolor = inVA ? colVA : colVPo))
+                int xs = bar_index - nb + 1
+                string vtip = "Estimated volume at price over the last " + str.tostring(nb) + " candles (" + volUnit + "). Shows where trading happened, not where orders are waiting."
+                vpLines.push(line.new(xs, vpPoc, bar_index + EXTEND, vpPoc, color = colPOC, width = 2))
+                vpLines.push(line.new(xs, vpVah, bar_index + EXTEND, vpVah, color = color.new(colPOC, 45), style = line.style_dotted))
+                vpLines.push(line.new(xs, vpVal, bar_index + EXTEND, vpVal, color = color.new(colPOC, 45), style = line.style_dotted))
+                vpLabels.push(label.new(bar_index + EXTEND, vpPoc, "POC " + fmtPrice(vpPoc), style = label.style_label_left, color = C_CLEAR, textcolor = colPOC, size = size.tiny,
+                     tooltip = "Point of control: the price row with the most traded volume. " + vtip))
+                vpLabels.push(label.new(bar_index + EXTEND, vpVah, "VAH", style = label.style_label_left, color = C_CLEAR, textcolor = color.new(colPOC, 30), size = size.tiny,
+                     tooltip = "Value area high: top of the zone holding " + str.tostring(vpVA) + "% of the volume."))
+                vpLabels.push(label.new(bar_index + EXTEND, vpVal, "VAL", style = label.style_label_left, color = C_CLEAR, textcolor = color.new(colPOC, 30), size = size.tiny,
+                     tooltip = "Value area low: bottom of the zone holding " + str.tostring(vpVA) + "% of the volume."))
+
 // ═════════════════════════════════════════ Live zones (redrawn on the last candle) ═════════════════════════════════════════
 var array<box>   zoneBoxes = array.new<box>()
 var array<line>  liqLines  = array.new<line>()
@@ -1359,6 +1541,14 @@ if barstate.islast
         dashRow(dash, r, "Market Direction", dirTxt, dirInt > 0 ? C_BULL : dirInt < 0 ? C_BEAR : fg, tsz,
              "Bullish when the last structure break was bullish and price is above the 50-period EMA; bearish for the opposite; otherwise neutral.")
         r += 1
+        if showVP and not na(vpPoc)
+            string vpPos = close > vpVah ? "Price above value area" : close < vpVal ? "Price below value area" : "Price inside value area"
+            dashRow(dash, r, "Volume Profile", vpPos + " · POC " + fmtPrice(vpPoc), fg, tsz,
+                 "Point of control (most traded price) " + fmtPrice(vpPoc) + ", value area " + fmtPrice(vpVal) + " to " + fmtPrice(vpVah) + " (" + str.tostring(vpVA) + "% of volume, last " + str.tostring(vpBars) + " candles). Estimated from candle volume; it shows where trading happened, not resting orders.")
+            r += 1
+        if detailed and kzChart
+            dashRow(dash, r, "ICT Session", kzName, fg, tsz, "ICT killzones in New York time: Asia 20:00–24:00, London 02:00–05:00, New York 07:00–10:00.")
+            r += 1
         if detailed
             dashRow(dash, r, "Market Structure", structRecent ? (cStructDir > 0 ? "Bullish " : "Bearish ") + (cStructKind == "MSS" ? "Market Structure Shift" : "Break of Structure") + (cStructHv ? " on high volume" : "") + " · " + agoText(lastClosed - cStructBar) : "None recently",
                  structRecent ? (cStructDir > 0 ? C_BULL : C_BEAR) : fg, tsz,

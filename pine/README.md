@@ -74,8 +74,9 @@ dashboard. Choose **Exchange volume** for futures such as `COMEX:GC1!`.
   Extreme spikes are never smaller than normal. *Largest bubble size* caps the top step.
 - **Colour:** green for a bullish candle, red for a bearish candle, **yellow for Extreme spikes**.
   All three colours and the transparency are adjustable.
-- **Value:** High and Extreme bubbles print their relative volume (or volume, or both) in the
-  centre. Hover the value to see every measured number for that candle.
+- **Value:** bubbles print the candle's volume (default; or relative volume, or both) in the
+  centre, from Elevated strength upwards (the latest 40 are labelled). Hover the value to see every
+  measured number for that candle.
 - **Placement:** centre of the candle (`(high + low) / 2`) by default, or beside the candle: below
   bullish candles and above bearish ones, 0.3 ATR away.
 - **Overlap control:** a bubble within *Minimum bars between bubbles* of the previous one is skipped
@@ -194,6 +195,36 @@ Every value has a tooltip explaining how it was calculated. Hover *Confirmation 
 - **Measured vs interpreted.** The dashboard separates *Measured data* from *Analysis*. Words like *accumulation-like* and *exhaustion* are interpretations of the numbers, never claims about institutional orders.
 - **Transparent and configurable.** Every threshold is an input, and every number shown has a tooltip with its formula.
 
+## Volume profile, key levels, sessions and EMA ribbon
+
+**Can it show where people put orders?** No indicator can, for XAUUSD. Resting orders live in brokers'
+and liquidity providers' books, and spot gold has no central order book that TradingView can show.
+Two tools come closest, and both are labelled for what they are:
+
+- **Volume profile (where trading happened):** a horizontal histogram of the volume traded at each
+  price over the last 150 candles (adjustable). Each candle's volume is spread evenly over its
+  high–low range, so it is an estimate (on OANDA it is tick volume).
+  - **POC (point of control):** the most-traded price row.
+  - **Value area (VAH / VAL):** the band around the POC that holds 70% of the volume.
+
+  High-volume prices often act as support or resistance because much trading took place there.
+- **ICT liquidity (where stop orders probably rest):** the indicator already marks swing-level
+  buy-side and sell-side liquidity, and merges equal highs and lows into EQH / EQL pools. It now also
+  draws the **previous day high / low (PDH / PDL)** and **previous week high / low (PWH / PWL)**.
+  ICT treats these levels as liquidity, and they are now also used as targets in *ICT liquidity
+  targets* mode. These are inferences from price structure, not order data.
+
+**ICT killzones** shade the sessions ICT focuses on, in New York time with daylight saving handled:
+Asia 20:00–24:00, London 02:00–05:00 and New York 07:00–10:00. They show on 1-hour and lower charts.
+The detailed dashboard shows the current session.
+
+**EMA ribbon:** a 20 / 50 EMA pair (adjustable) with a green fill when the fast EMA is above the slow
+one and red otherwise.
+
+The volume profile maths was checked against an independent fine-sampling calculation on real gold
+data: volume is conserved exactly, the POC is the largest row, and the value area holds the requested
+share of volume.
+
 ## 9. Inputs
 
 | Group | Inputs |
@@ -205,6 +236,8 @@ Every value has a tooltip explaining how it was calculated. Hover *Confirmation 
 | 5 · Stop loss and take profit | Buffer type and size (ATR / price / ticks), spread allowance, minimum / maximum stop distance, take profit method, three risk multiples, ICT minimum target distance, equal highs / lows tolerance, trades kept, tracking limit, label offset and stagger |
 | 6 · Structure and zones | Swing detection length, zones per side |
 | 7 · Dashboard | Detail level, position, text size |
+| 8 · Volume profile | On/off, length, rows, value area %, width, placement, colours |
+| 9 · Key levels, sessions and EMA ribbon | Previous day / week high and low, ICT killzones, EMA ribbon and lengths |
 
 ## Suggested XAUUSD settings
 
