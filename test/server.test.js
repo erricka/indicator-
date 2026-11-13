@@ -52,6 +52,7 @@ test('health check, validation and path traversal', async () => {
   assert.match((await bad.json()).error, /timeframe/i);
   const badSym = await fetch(`${base}/api/candles?symbol=${encodeURIComponent('<script>')}&tf=1h`);
   assert.equal(badSym.status, 400);
+  assert.equal((await fetch(`${base}/%E0%A4%A`)).status, 400, 'malformed escape is a client error');
   const trav = await fetch(`${base}/%2e%2e/server.js`);
   assert.ok([403, 404].includes(trav.status));
   const sym = await (await fetch(`${base}/api/symbols`)).json();

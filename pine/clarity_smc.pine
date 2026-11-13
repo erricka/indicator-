@@ -257,7 +257,9 @@ bool useTod      = todCapable and baseMode == "Same time of day"
 var array<float> todVals = array.new<float>(slotsPerDay * todDays, 0.0)
 var array<int>   todPos  = array.new<int>(slotsPerDay, 0)
 var array<int>   todCnt  = array.new<int>(slotsPerDay, 0)
-int slot = todCapable ? math.min(math.floor((time % 86400000) / (tfSec * 1000.0)), slotsPerDay - 1) : 0
+// Clock slot in the exchange time zone, so session opens stay aligned across daylight-saving changes.
+int secOfDay = (hour(time, syminfo.timezone) * 60 + minute(time, syminfo.timezone)) * 60
+int slot = todCapable ? math.min(math.floor(secOfDay / (tfSec * 1.0)), slotsPerDay - 1) : 0
 
 float todMean = na
 int   todN    = 0
@@ -355,7 +357,8 @@ bool chkPart   = volOk and volFast > volSlow
 bool chkFlowUp = flowBull or (not na(bullShare) and bullShare >= 0.55)
 bool chkFlowDn = flowBear or (not na(bullShare) and bullShare <= 0.45)
 
-string volTip = "MEASURED\n" + volUnit + ": " + fmtVol(vol) + "\nbaseline (" + baseDesc + "): " + fmtVol(baseMean) +
+volTipText() =>
+    "MEASURED\n" + volUnit + ": " + fmtVol(vol) + "\nbaseline (" + baseDesc + "): " + fmtVol(baseMean) +
      "\nrelative volume: " + fmtNum(rvol, "#.##") + "×\nz-score (log scale): " + fmtNum(zScore, "#.#") +
      "\ncandle: " + (candleDir > 0 ? "bullish" : candleDir < 0 ? "bearish" : "neutral") + "\nstrength: " + volStrength
 
@@ -625,11 +628,16 @@ ictTargets(int dir, float entry, float risk, float atrNow) =>
     [tps.get(0), tps.get(1), tps.get(2), names.get(0), names.get(1), names.get(2)]
 
 // Complete trade plan for a trigger: stop, risk, three targets, and a rejection reason if any.
-buildPlan(int dir, float entry, bool useSweep, int sweepIdx, bool useOb, float obLevel, float swingLevel, float fallback, float atrNow) =>
-    [sl, basis] = stopFor(dir, entry, useSweep, sweepIdx, useOb, obLevel, swingLevel, fallback, atrNow)
+buildPlan(bool active, int dir, float entry, bool useSweep, int sweepIdx, bool useOb, float obLevel, float swingLevel, float fallback, float atrNow) =>
+    float sl = na
+    string basis = ""
+    if active
+        [s0, b0] = stopFor(dir, entry, useSweep, sweepIdx, useOb, obLevel, swingLevel, fallback, atrNow)
+        sl := s0
+        basis := b0
     float risk = (entry - sl) * dir
     string reject = ""
-    if maxRiskAtr > 0 and atrNow > 0 and risk > maxRiskAtr * atrNow
+    if active and maxRiskAtr > 0 and atrNow > 0 and risk > maxRiskAtr * atrNow
         reject := "stop distance " + str.tostring(risk / atrNow, "#.##") + " ATR is wider than the " + str.tostring(maxRiskAtr) + " ATR maximum"
     float t1 = entry + dir * risk * rr1
     float t2 = entry + dir * risk * rr2
@@ -637,7 +645,7 @@ buildPlan(int dir, float entry, bool useSweep, int sweepIdx, bool useOb, float o
     string n1 = "risk multiple " + str.tostring(rr1)
     string n2 = "risk multiple " + str.tostring(rr2)
     string n3 = "risk multiple " + str.tostring(rr3)
-    if tpMode == "ICT liquidity targets"
+    if active and tpMode == "ICT liquidity targets"
         [a1, a2, a3, b1, b2, b3] = ictTargets(dir, entry, risk, atrNow)
         t1 := a1
         t2 := a2
@@ -651,7 +659,7 @@ drawStructure(string kind, int dir, int fromIdx, float price, bool hv) =>
     color col = dir > 0 ? C_BULL : C_BEAR
     line ln = line.new(fromIdx, price, bar_index, price, color = color.new(col, kind == "MSS" ? 0 : 25), style = line.style_dashed, width = 1)
     string tip = (kind == "MSS" ? "Market Structure Shift" : "Break of Structure") + (dir > 0 ? " (bullish)" : " (bearish)") +
-         "\nclose beyond the swing at " + fmtPrice(price) + "\n" + volTip
+         "\nclose beyond the swing at " + fmtPrice(price) + "\n" + volTipText()
     label lb = label.new(math.round((fromIdx + bar_index) / 2.0), price, kind + (hv ? " · HV" : ""), style = dir > 0 ? label.style_label_down : label.style_label_up,
          color = C_CLEAR, textcolor = col, size = size.tiny, tooltip = tip)
     structLines.push(ln)
@@ -975,8 +983,8 @@ if bar_index >= 2 and atr > 0
 int checksUp = (chkSpike ? 1 : 0) + (chkFlowUp ? 1 : 0) + (chkPart ? 1 : 0) + (trend == 1 ? 1 : 0)
 int checksDn = (chkSpike ? 1 : 0) + (chkFlowDn ? 1 : 0) + (chkPart ? 1 : 0) + (trend == -1 ? 1 : 0)
 
-[slU, basisU, riskU, t1U, t2U, t3U, n1U, n2U, n3U, rejU] = buildPlan(1, close, lsU, memUp.sweepIdx, obU, obStopUp, swLoPrice, recentLow, atr)
-[slD, basisD, riskD, t1D, t2D, t3D, n1D, n2D, n3D, rejD] = buildPlan(-1, close, lsD, memDn.sweepIdx, obD, obStopDn, swHiPrice, recentHigh, atr)
+[slU, basisU, riskU, t1U, t2U, t3U, n1U, n2U, n3U, rejU] = buildPlan(trigUp, 1, close, lsU, memUp.sweepIdx, obU, obStopUp, swLoPrice, recentLow, atr)
+[slD, basisD, riskD, t1D, t2D, t3D, n1D, n2D, n3D, rejD] = buildPlan(trigDn, -1, close, lsD, memDn.sweepIdx, obD, obStopDn, swHiPrice, recentHigh, atr)
 
 bool okUp = trigUp and checksUp >= minConf and rejU == ""
 bool okDn = trigDn and checksDn >= minConf and rejD == ""
@@ -1037,7 +1045,7 @@ addSweepLabel(int dir, float levelPrice, bool hv) =>
     label lb = label.new(bar_index, dir > 0 ? low : high, (dir > 0 ? "LS ▲" : "LS ▼") + (hv ? " · HV" : ""),
          yloc = dir > 0 ? yloc.belowbar : yloc.abovebar, style = dir > 0 ? label.style_label_up : label.style_label_down,
          color = C_CLEAR, textcolor = dir > 0 ? C_BULL : C_BEAR, size = size.tiny,
-         tooltip = "Liquidity sweep: wick through " + fmtPrice(levelPrice) + " and close back inside\n" + volTip)
+         tooltip = "Liquidity sweep: wick through " + fmtPrice(levelPrice) + " and close back inside\n" + volTipText())
     label mk = label.new(bar_index, levelPrice, "×", style = label.style_label_center, color = C_CLEAR, textcolor = C_LIQ, size = size.small)
     sweepLabels.push(lb)
     sweepLabels.push(mk)
@@ -1141,7 +1149,7 @@ int strengthLevel = isExtreme ? 3 : isSpike ? 2 : isElevated ? 1 : 0
 int textMinLevel  = bubbleTextMin == "Elevated" ? 1 : bubbleTextMin == "High" ? 2 : 3
 if drawBubble and bubbleText != "None" and strengthLevel >= textMinLevel
     string bt = bubbleText == "Relative volume" ? fmtNum(rvol, "#.#") + "×" : bubbleText == "Volume" ? fmtVol(vol) : fmtNum(rvol, "#.#") + "× · " + fmtVol(vol)
-    label blb = label.new(bar_index, bubY, bt, style = label.style_label_center, color = C_CLEAR, textcolor = chart.fg_color, size = size.tiny, tooltip = volTip)
+    label blb = label.new(bar_index, bubY, bt, style = label.style_label_center, color = C_CLEAR, textcolor = chart.fg_color, size = size.tiny, tooltip = volTipText())
     bubbleLabels.push(blb)
     if bubbleLabels.size() > MAX_BUB_LABELS
         label.delete(bubbleLabels.shift())

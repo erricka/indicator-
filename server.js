@@ -194,6 +194,7 @@ async function fromYahoo(sym, tf) {
         source: 'yahoo', sourceLabel: 'Yahoo Finance', delayed: true,
         bars: bars.slice(-MAX_BARS),
         currency: r.meta?.currency || null,
+        session: r.meta?.currentTradingPeriod?.regular || null,
       };
     } catch (err) { lastErr = err; }
   }
@@ -224,6 +225,16 @@ function demoBars(sym, tf) {
   return { source: 'demo', sourceLabel: 'Demo data', bars };
 }
 
+// Is the newest bar still trading? Crypto bars sit on a fixed time grid; Yahoo bars start at the
+// session open, so for them the exchange session tells us whether the last bar can still change.
+function withOpenFlag(out, tf) {
+  const nowS = Date.now() / 1000;
+  const last = out.bars[out.bars.length - 1];
+  const { session, ...rest } = out;
+  const lastBarOpen = session ? nowS >= session.start && nowS < session.end : last[0] + tf.sec > nowS;
+  return { ...rest, lastBarOpen };
+}
+
 const cache = new Map();
 
 export async function getCandles(rawSymbol, tfKey) {
@@ -242,14 +253,14 @@ export async function getCandles(rawSymbol, tfKey) {
     for (const provider of providers) {
       try {
         const out = await provider(sym, tf);
-        if (out.bars.length >= 30) return out;
+        if (out.bars.length >= 30) return withOpenFlag(out, tf);
         errors.push(`${out.sourceLabel}: only ${out.bars.length} bars`);
       } catch (err) {
         errors.push(err.message);
       }
     }
     console.warn(`[data] ${key} falling back to demo: ${errors.join(' | ')}`);
-    return { ...demoBars(sym, tf), notice: 'Live data unavailable — showing synthetic demo data.' };
+    return withOpenFlag({ ...demoBars(sym, tf), notice: 'Live data unavailable — showing synthetic demo data.' }, tf);
   })().then((out) => ({
     symbol: sym.symbol, label: sym.label, name: sym.name, group: sym.group,
     tf: tfKey, intervalSec: tf.sec, serverTime: Date.now(), ...out,
@@ -316,7 +327,12 @@ async function loadFile(file) {
 async function serveStatic(req, res, pathname) {
   let file = VENDOR[pathname];
   if (!file) {
-    const rel = pathname === '/' ? 'index.html' : decodeURIComponent(pathname).replace(/^\/+/, '');
+    let rel;
+    try {
+      rel = pathname === '/' ? 'index.html' : decodeURIComponent(pathname).replace(/^\/+/, '');
+    } catch {
+      return send(res, 400, 'Bad request');
+    }
     file = path.normalize(path.join(PUBLIC_DIR, rel));
     if (!file.startsWith(PUBLIC_DIR + path.sep)) return send(res, 403, 'Forbidden');
   }

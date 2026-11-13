@@ -226,6 +226,7 @@ function applyData(data, reset) {
   const incoming = data.bars.map(toBar);
   state.clockOffset = data.serverTime - Date.now();
   state.intervalSec = data.intervalSec;
+  state.lastBarOpen = data.lastBarOpen !== false;
   const sourceChanged = state.meta && state.meta.source !== data.source;
   if (reset || sourceChanged || !mergeBars(incoming)) {
     state.meta = data;
@@ -278,8 +279,11 @@ function analysisOptions() {
 // Signals use closed candles only, so nothing repaints while a candle is still forming.
 function recompute(force) {
   const now = Date.now() + state.clockOffset;
+  // The server reports whether the newest bar is still trading (exchange session for stocks,
+  // time grid for crypto). Between polls, a grid bar also closes once its interval has elapsed.
   let closed = state.bars.length;
-  while (closed > 0 && (state.bars[closed - 1].time + state.intervalSec) * 1000 > now) closed--;
+  const last = state.bars[closed - 1];
+  if (last && state.lastBarOpen && (state.meta?.source === 'yahoo' || (last.time + state.intervalSec) * 1000 > now)) closed--;
   if (force || closed !== state.closedCount) {
     state.closedCount = closed;
     const closedBars = state.bars.slice(0, closed);
