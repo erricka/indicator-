@@ -550,7 +550,7 @@ if inWindow
         deleteDrawn(drawn.shift())
     drawn.push(renderCandle(fa, fpTotal, fpBuy, fpSell, fpDelta, fpDeltaPct, not barstate.isconfirmed))
 
-var table statusTbl = table.new(statusPos, 1, STATUS_ROWS, bgcolor = color.new(chart.bg_color, 8),
+var table statusTbl = table.new(statusPos, 1, STATUS_ROWS, bgcolor = color.new(chart.bg_color, 10),
      frame_color = color.new(chart.fg_color, 75), frame_width = 1)
 if barstate.islast
     updateStatus(statusTbl, drawn, fpBarsSeen)
