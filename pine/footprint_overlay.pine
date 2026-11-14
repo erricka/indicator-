@@ -1,0 +1,607 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────
+// Footprint Overlay — TradingView volume footprint rows drawn on the price chart (Pine Script v6)
+//
+// WHERE THE NUMBERS COME FROM
+//   • Every volume value comes from ONE request.footprint() call (Pine allows only one). Nothing is
+//     estimated or redistributed from candle OHLCV.
+//   • TradingView builds each footprint from lower-timeframe ("intrabar") data. An intrabar's volume is
+//     "buy" when that intrabar closed above its open and "sell" when it closed below; when open = close it
+//     takes the side of the price change from the previous intrabar close (or the previous side if unchanged).
+//     request.footprint() always uses this method, even when the chart's "Tick-based calculation" is on.
+//     "Buy" and "sell" are therefore up-move / down-move volume estimates, NOT exchange-reported aggressive
+//     orders hitting the bid or lifting the ask.
+//   • Requires a TradingView Premium or Ultimate plan. Other plans cannot run footprint requests.
+//
+// LIVE VS HISTORICAL
+//   • Historical footprints use the finest intrabar data available (tick → 1S → 1m → 60m as history gets
+//     older), so older candles are coarser. The open candle updates on every tick and is PROVISIONAL until it
+//     closes. After a reload TradingView may rebuild a candle from different intrabar data, so values can
+//     differ slightly from what was seen live. Nothing here reads future bars (no lookahead, no offsets).
+//
+// LAYOUT (per candle, x = time inside the candle's own bar slot)
+//   [stacked-sell bar] [ SELL cells ] [ gap: thin strip of the real candle ] [ BUY cells ] [stacked-buy bar]
+//   Delta mode: one DELTA column to the right of the candle.
+//   Zoom in until each bar is roughly 100–150 px wide; text size "Auto" fits each cell.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────
+
+//@version=6
+indicator("Footprint Overlay", "Footprint", overlay = true, behind_chart = false,
+     max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, calc_bars_count = 1500)
+
+// ═══════════════════════════════════════════ Constants ═══════════════════════════════════════════
+// Budgets stay below Pine's 500-object caps so the runtime never garbage-collects (silently deletes) cells.
+const int    BOX_BUDGET   = 490
+const int    LINE_BUDGET  = 490
+const int    LABEL_BUDGET = 490
+const int    STATUS_ROWS  = 10
+
+const string MODE_BS    = "Buy/Sell"
+const string MODE_DELTA = "Delta"
+const string SRC_NATIVE = "Native flags (TradingView)"
+const string SRC_SCRIPT = "Script recalculation"
+const string AL_CLOSE   = "Confirmed candle close"
+const string AL_LIVE    = "Live (provisional, once per candle)"
+const string DU_PCT     = "% of candle volume"
+const string DU_VOL     = "Volume"
+const string ST_ALWAYS  = "Always"
+const string ST_NOTICE  = "Only with notices"
+const string ST_OFF     = "Off"
+
+// ═══════════════════════════════════════════ Inputs ══════════════════════════════════════════════
+const string G_DATA = "Footprint data"
+int   ticksInput = input.int(100, "Ticks per row", minval = 1, group = G_DATA, display = display.none,
+     tooltip = "Row height = this × the symbol's minimum tick (syminfo.mintick). Larger values give fewer, taller, more readable rows. The status panel suggests a value when rows are hidden or too few.")
+float vaInput    = input.float(70.0, "Value area %", minval = 1.0, maxval = 100.0, step = 5.0, group = G_DATA, display = display.none,
+     tooltip = "Share of each candle's footprint volume inside the value area. Passed to request.footprint(), which returns the VAH and VAL rows.")
+float imbInput   = input.float(300.0, "Imbalance threshold %", minval = 101.0, step = 25.0, group = G_DATA, display = display.none,
+     tooltip = "300% means the dominant volume must be at least 3× the diagonal opposing volume. Passed to request.footprint(), so it also sets TradingView's native imbalance flags.")
+
+const string G_DISP = "Display"
+string modeInput        = input.string(MODE_BS, "Mode", options = [MODE_BS, MODE_DELTA], group = G_DISP, display = display.none,
+     tooltip = "Buy/Sell: sell volume left of the candle, buy volume right. Delta: one column right of the candle with buy − sell per row.")
+int    candlesInput     = input.int(8, "Recent candles to display", minval = 1, maxval = 50, group = G_DISP, display = display.none,
+     tooltip = "The status panel says so if the object budget allows fewer candles than requested.")
+int    maxRowsInput     = input.int(28, "Max rows rendered per candle", minval = 3, maxval = 120, group = G_DISP, display = display.none,
+     tooltip = "Each candle reserves this many rows of boxes (×2 in Buy/Sell mode). Candles with more rows show the rows around the POC and say how many are hidden. Totals, POC, value area, imbalances and alerts always use ALL rows.")
+string cellTextInput    = input.string("Auto", "Cell text size", options = ["Auto", "Tiny", "Small", "Normal", "Large"], group = G_DISP, display = display.none,
+     tooltip = "Auto scales the numbers to fit each cell, so they grow as you zoom in.")
+bool   opaqueInput      = input.bool(true, "Opaque cells (hide the candle body behind the footprint)", group = G_DISP, display = display.none,
+     tooltip = "On: cell colors are pre-blended with the chart background so the candle does not show through the numbers. The center gap still shows a thin strip of the real candle.")
+int    gapInput         = input.int(12, "Center gap (% of bar width)", minval = 0, maxval = 40, group = G_DISP, display = display.none)
+bool   showSummaryInput = input.bool(true, "Summary below candle (volume, delta, delta %)", group = G_DISP, display = display.none)
+string summaryTextInput = input.string("Small", "Summary text size", options = ["Tiny", "Small", "Normal"], group = G_DISP, display = display.none)
+string statusInput      = input.string(ST_ALWAYS, "Status panel", options = [ST_ALWAYS, ST_NOTICE, ST_OFF], group = G_DISP, display = display.none)
+string statusPosInput   = input.string("Bottom left", "Status panel position", options = ["Bottom left", "Bottom right", "Top left", "Top right"], group = G_DISP, display = display.none)
+
+const string G_HL = "Highlights"
+bool showPocInput   = input.bool(true, "Point of Control (POC) frame", group = G_HL, display = display.none)
+bool showVaInput    = input.bool(true, "Value area frame", group = G_HL, display = display.none)
+bool showImbInput   = input.bool(true, "Imbalance cells (bold text + colored border)", group = G_HL, display = display.none)
+bool showStackInput = input.bool(true, "Stacked imbalance bars", group = G_HL, display = display.none)
+
+const string G_IMB = "Imbalances"
+string imbSourceInput = input.string(SRC_NATIVE, "Imbalance source", options = [SRC_NATIVE, SRC_SCRIPT], group = G_IMB, display = display.none,
+     tooltip = "Native: volume_row.has_buy_imbalance() / has_sell_imbalance() from TradingView. Script: the same diagonal rule recalculated here with explicit edge and zero-volume rules (see below).")
+bool   zeroOppInput   = input.bool(true, "Script mode: zero opposing volume counts as imbalance", group = G_IMB, display = display.none,
+     tooltip = "Script mode only. When the diagonal opposing volume is 0 and this row's dominant side is > 0, the ratio is undefined. On: counts as an imbalance. Off: never. 0 vs 0 is never an imbalance.")
+int    stackInput     = input.int(3, "Stacked imbalance: consecutive rows", minval = 2, maxval = 20, group = G_IMB, display = display.none)
+float  minImbVolInput = input.float(0.0, "Min volume for imbalance signals", minval = 0.0, group = G_IMB, display = display.none,
+     tooltip = "The dominant volume of an imbalanced row (buy for buy imbalances, sell for sell imbalances) must be at least this. Applies to highlights, stacks and alerts. 0 = off.")
+
+const string G_COL = "Colors"
+color buyColInput     = input.color(#26A69A, "Buy", inline = "c1", group = G_COL, display = display.none)
+color sellColInput    = input.color(#EF5350, "Sell", inline = "c1", group = G_COL, display = display.none)
+color buyImbColInput  = input.color(#00E676, "Buy imbalance", inline = "c2", group = G_COL, display = display.none)
+color sellImbColInput = input.color(#FF1744, "Sell imbalance", inline = "c2", group = G_COL, display = display.none)
+color pocColInput     = input.color(#FFD600, "POC", inline = "c3", group = G_COL, display = display.none)
+color vaColInput      = input.color(#2962FF, "Value area", inline = "c3", group = G_COL, display = display.none)
+bool  autoTextInput   = input.bool(true, "Text: chart foreground", inline = "c4", group = G_COL, display = display.none)
+color textColInput    = input.color(#FFFFFF, "", inline = "c4", group = G_COL, display = display.none)
+int   strongTranspInput = input.int(10, "Strongest cell transparency", minval = 0, maxval = 100, group = G_COL, display = display.none,
+     tooltip = "Transparency of the cell with the most volume in its candle. Cells in between scale linearly with their volume.")
+int   weakTranspInput   = input.int(88, "Weakest cell transparency", minval = 0, maxval = 100, group = G_COL, display = display.none,
+     tooltip = "Transparency of a cell with zero volume.")
+
+const string G_AL = "Alerts"
+string alertTimingInput = input.string(AL_CLOSE, "Alert timing", options = [AL_CLOSE, AL_LIVE], group = G_AL, display = display.none,
+     tooltip = "Confirmed: evaluated once on the candle's closing tick. Live: fires the first time the condition appears on the open candle (at most once per candle); the candle may still change.")
+bool   alStackBuyInput  = input.bool(true, "Stacked buy imbalance", group = G_AL, display = display.none)
+bool   alStackSellInput = input.bool(true, "Stacked sell imbalance", group = G_AL, display = display.none)
+bool   alDeltaPosInput  = input.bool(false, "Positive delta beyond threshold", group = G_AL, display = display.none)
+bool   alDeltaNegInput  = input.bool(false, "Negative delta beyond threshold", group = G_AL, display = display.none)
+float  deltaThreshInput = input.float(30.0, "Delta threshold", minval = 0.0, group = G_AL, display = display.none, inline = "dt")
+string deltaUnitInput   = input.string(DU_PCT, "", options = [DU_PCT, DU_VOL], group = G_AL, display = display.none, inline = "dt",
+     tooltip = "Positive alert: delta > +threshold. Negative alert: delta < −threshold. In % mode, delta % = delta / total volume × 100.")
+
+// ═══════════════════════════════════════════ Derived settings ════════════════════════════════════
+bool   isBS        = modeInput == MODE_BS
+bool   useNative   = imbSourceInput == SRC_NATIVE
+float  imbRatio    = imbInput / 100.0
+int    barMs       = timeframe.in_seconds() * 1000
+float  halfGap     = gapInput / 200.0
+float  alphaWeak   = 1.0 - weakTranspInput / 100.0
+float  alphaStrong = 1.0 - strongTranspInput / 100.0
+color  textCol     = autoTextInput ? chart.fg_color : textColInput
+color  gridCol     = opaqueInput ? chart.bg_color : color.new(chart.fg_color, 85)
+bool   confirmedAl = alertTimingInput == AL_CLOSE
+
+// Object budget → how many candles can be drawn. Every candle reserves its worst case, so a candle never
+// needs more objects than were set aside for it and Pine's automatic deletion of old drawings never kicks in.
+int cellsPerRow     = isBS ? 2 : 1
+int framesPerCandle = (showVaInput ? 1 : 0) + (showPocInput ? 1 : 0)
+int boxesPerCandle  = maxRowsInput * cellsPerRow + framesPerCandle
+int linesPerCandle  = showStackInput ? 2 * (math.floor(maxRowsInput / stackInput) + 2) : 0
+int capByBoxes      = math.floor(BOX_BUDGET / boxesPerCandle)
+int capByLines      = linesPerCandle > 0 ? math.floor(LINE_BUDGET / linesPerCandle) : LABEL_BUDGET
+int capacity        = math.max(1, math.min(candlesInput, capByBoxes, capByLines, LABEL_BUDGET))
+
+// ═══════════════════════════════════════════ Types ═══════════════════════════════════════════════
+// Row-level analysis of one candle's footprint. Index 0 = lowest price row (footprint.rows() order).
+type FpAnalysis
+    int          n           = 0
+    array<float> dn
+    array<float> up
+    array<float> buy
+    array<float> sell
+    array<bool>  bImb
+    array<bool>  sImb
+    array<int>   bRunS
+    array<int>   bRunE
+    array<int>   sRunS
+    array<int>   sRunE
+    int          pocIdx      = -1
+    int          vahIdx      = -1
+    int          valIdx      = -1
+    int          bImbCount   = 0
+    int          sImbCount   = 0
+    float        maxSide     = 0.0
+    float        maxAbsDelta = 0.0
+
+// Drawing objects of one rendered candle, plus the facts the status panel reports.
+type Drawn
+    array<box>  boxes
+    array<line> lines
+    label       info
+    bool        hasData    = false
+    bool        zeroVol    = false
+    int         rows       = 0
+    int         hidden     = 0
+    float       rangeTicks = 0.0
+
+// ═══════════════════════════════════════════ Helpers ═════════════════════════════════════════════
+sizeFromName(string name) =>
+    switch name
+        "Tiny"   => size.tiny
+        "Small"  => size.small
+        "Normal" => size.normal
+        "Large"  => size.large
+        => size.auto
+
+string cellSize    = sizeFromName(cellTextInput)
+string summarySize = sizeFromName(summaryTextInput)
+
+string statusPos = switch statusPosInput
+    "Bottom right" => position.bottom_right
+    "Top left"     => position.top_left
+    "Top right"    => position.top_right
+    => position.bottom_left
+
+// Compact volume text: 1.23B, 4.5M, 12.3K, 845, 12.5, 0.034.
+fmtVol(float v) =>
+    float a = math.abs(v)
+    na(v) ? "—" :
+     a >= 1000000000.0 ? str.tostring(v / 1000000000.0, "#.##") + "B" :
+     a >= 1000000.0    ? str.tostring(v / 1000000.0, "#.##") + "M" :
+     a >= 10000.0      ? str.tostring(v / 1000.0, "#.#") + "K" :
+     a >= 1000.0       ? str.tostring(v / 1000.0, "#.##") + "K" :
+     a >= 100.0        ? str.tostring(v, "#") :
+     a >= 10.0         ? str.tostring(v, "#.#") :
+     a >= 1.0          ? str.tostring(v, "#.##") :
+     a == 0.0          ? "0" : str.tostring(v, "#.####")
+
+fmtSigned(float v) =>
+    na(v) ? "—" : (v > 0 ? "+" : "") + fmtVol(v)
+
+fmtPct(float p) =>
+    na(p) ? "—" : (p > 0 ? "+" : "") + str.tostring(p, "#.#") + "%"
+
+fmtPrice(float p) =>
+    str.tostring(p, format.mintick)
+
+// Opaque equivalent of drawing color `c` at opacity `alpha` over `base` (used for "opaque cells").
+blend(color base, color c, float alpha) =>
+    float a = math.max(0.0, math.min(1.0, alpha))
+    color.rgb(color.r(base) + (color.r(c) - color.r(base)) * a,
+     color.g(base) + (color.g(c) - color.g(base)) * a,
+     color.b(base) + (color.b(c) - color.b(base)) * a, 0)
+
+// Cell background: intensity grows linearly with the cell's volume relative to the candle's busiest cell.
+cellBg(color c, float ratio) =>
+    float a = alphaWeak + (alphaStrong - alphaWeak) * math.max(0.0, math.min(1.0, ratio))
+    opaqueInput ? blend(chart.bg_color, c, a) : color.new(c, 100.0 * (1.0 - a))
+
+// ═══════════════════════════════════════════ 1 · Data retrieval ══════════════════════════════════
+// The script's only footprint request. Returns na when TradingView has no footprint for the bar.
+footprint fp = request.footprint(ticksInput, va_percent = vaInput, imbalance_percent = imbInput)
+bool hasFp = not na(fp)
+
+// ═══════════════════════════════════════════ 2 · Calculations ════════════════════════════════════
+// Candle totals. Delta = buy − sell. Delta % = delta / total × 100, and na (shown "—") when total is 0.
+candleMetrics(footprint f) =>
+    float tot  = na
+    float buy  = na
+    float sell = na
+    float dlt  = na
+    float pct  = na
+    if not na(f)
+        buy  := nz(f.buy_volume())
+        sell := nz(f.sell_volume())
+        tot  := nz(f.total_volume())
+        dlt  := buy - sell
+        pct  := tot > 0 ? dlt / tot * 100.0 : na
+    [tot, buy, sell, dlt, pct]
+
+// Runs of at least `minLen` consecutive flagged rows. Rows must touch (upper price of one = lower price of
+// the next) to count as consecutive. Returns parallel arrays of first and last row indexes.
+findRuns(array<bool> flags, array<float> dn, array<float> up, float tol, int minLen) =>
+    array<int> starts = array.new<int>()
+    array<int> ends   = array.new<int>()
+    int n        = flags.size()
+    int runStart = -1
+    for i = 0 to n
+        bool on    = i < n ? flags.get(i) : false
+        bool joins = false
+        if on and runStart >= 0 and i > 0
+            joins := math.abs(up.get(i - 1) - dn.get(i)) <= tol
+        if runStart >= 0 and not joins
+            if i - runStart >= minLen
+                starts.push(runStart)
+                ends.push(i - 1)
+            runStart := -1
+        if on and runStart < 0
+            runStart := i
+    [starts, ends]
+
+// Reads every row of one footprint and derives POC / VA indexes, diagonal imbalances and stacked runs.
+//   Buy imbalance at row i : buy[i]  ≥ ratio × sell[row directly BELOW i]
+//   Sell imbalance at row i: sell[i] ≥ ratio × buy[row directly ABOVE i]
+//   ratio = threshold % / 100 (300% → 3×), the formula TradingView documents for its footprint chart.
+analyzeFootprint(footprint f) =>
+    FpAnalysis a = FpAnalysis.new(dn = array.new<float>(), up = array.new<float>(), buy = array.new<float>(),
+         sell = array.new<float>(), bImb = array.new<bool>(), sImb = array.new<bool>())
+    array<volume_row> rows = f.rows()
+    int   n   = rows.size()
+    float tol = syminfo.mintick * 0.5
+    a.n := n
+    if n > 0
+        volume_row pocRow = f.poc()
+        volume_row vahRow = f.vah()
+        volume_row valRow = f.val()
+        float pocUp = na(pocRow) ? na : pocRow.up_price()
+        float vahUp = na(vahRow) ? na : vahRow.up_price()
+        float valUp = na(valRow) ? na : valRow.up_price()
+        array<bool> natB = array.new<bool>()
+        array<bool> natS = array.new<bool>()
+        for [i, r] in rows
+            float rUp = r.up_price()
+            a.dn.push(r.down_price())
+            a.up.push(rUp)
+            a.buy.push(nz(r.buy_volume()))
+            a.sell.push(nz(r.sell_volume()))
+            natB.push(r.has_buy_imbalance())
+            natS.push(r.has_sell_imbalance())
+            if not na(pocUp) and math.abs(rUp - pocUp) <= tol
+                a.pocIdx := i
+            if not na(vahUp) and math.abs(rUp - vahUp) <= tol
+                a.vahIdx := i
+            if not na(valUp) and math.abs(rUp - valUp) <= tol
+                a.valIdx := i
+        for i = 0 to n - 1
+            float b  = a.buy.get(i)
+            float s  = a.sell.get(i)
+            bool  bi = false
+            bool  si = false
+            if useNative
+                bi := natB.get(i)
+                si := natS.get(i)
+            else
+                // Lowest row: nothing below → no buy imbalance. Highest row: nothing above → no sell imbalance.
+                // A missing (non-touching) neighbour level inside the candle counts as 0 opposing volume.
+                if i > 0
+                    float sBelow = math.abs(a.up.get(i - 1) - a.dn.get(i)) <= tol ? a.sell.get(i - 1) : 0.0
+                    bi := sBelow > 0 ? b >= imbRatio * sBelow : zeroOppInput
+                if i < n - 1
+                    float bAbove = math.abs(a.dn.get(i + 1) - a.up.get(i)) <= tol ? a.buy.get(i + 1) : 0.0
+                    si := bAbove > 0 ? s >= imbRatio * bAbove : zeroOppInput
+            // Both sources: the dominant side must have volume and meet the minimum-volume filter.
+            bi := bi and b > 0 and b >= minImbVolInput
+            si := si and s > 0 and s >= minImbVolInput
+            a.bImb.push(bi)
+            a.sImb.push(si)
+            a.bImbCount   += bi ? 1 : 0
+            a.sImbCount   += si ? 1 : 0
+            a.maxSide     := math.max(a.maxSide, b, s)
+            a.maxAbsDelta := math.max(a.maxAbsDelta, math.abs(b - s))
+    [bS, bE] = findRuns(a.bImb, a.dn, a.up, tol, stackInput)
+    [sS, sE] = findRuns(a.sImb, a.dn, a.up, tol, stackInput)
+    a.bRunS := bS
+    a.bRunE := bE
+    a.sRunS := sS
+    a.sRunE := sE
+    a
+
+// Text for alerts: number of stacked runs and the longest one's price range.
+stackText(array<int> rs, array<int> re, FpAnalysis a) =>
+    int best    = 0
+    int bestLen = 0
+    for [k, s0] in rs
+        int len = re.get(k) - s0 + 1
+        if len > bestLen
+            bestLen := len
+            best    := k
+    str.format("{0} run(s), longest {1} rows {2}–{3}", rs.size(), bestLen,
+         fmtPrice(a.dn.get(rs.get(best))), fmtPrice(a.up.get(re.get(best))))
+
+// ═══════════════════════════════════════════ 3 · Rendering ═══════════════════════════════════════
+deleteDrawn(Drawn d) =>
+    for b in d.boxes
+        b.delete()
+    for l in d.lines
+        l.delete()
+    if not na(d.info)
+        d.info.delete()
+
+drawCell(int x1, int x2, float top, float bot, string txt, color bg, bool imb, color imbCol) =>
+    box.new(x1, top, x2, bot, border_color = imb ? imbCol : gridCol, border_width = imb ? 2 : 1,
+         xloc = xloc.bar_time, bgcolor = bg, text = txt, text_size = cellSize, text_color = textCol,
+         text_formatting = imb ? text.format_bold : text.format_none)
+
+// Draws one candle's footprint on its own bar slot and returns the created objects.
+renderCandle(FpAnalysis a, float tot, float buy, float sell, float dlt, float pct, bool live) =>
+    Drawn d = Drawn.new(boxes = array.new<box>(), lines = array.new<line>())
+    d.rangeTicks := (high - low) / syminfo.mintick
+    // x coordinates are timestamps inside this bar's slot (slot = one bar duration centred on `time`).
+    int xOuterL = time - math.round(barMs * 0.44)
+    int xInnerL = time - math.round(barMs * halfGap)
+    int xInnerR = time + math.round(barMs * halfGap)
+    int xOuterR = time + math.round(barMs * 0.44)
+    int xStackL = time - math.round(barMs * 0.47)
+    int xStackR = time + math.round(barMs * 0.47)
+    int xFrameL = isBS ? xOuterL : xInnerR
+    if na(a)
+        // No footprint for this candle: say so rather than draw anything that looks like data.
+        d.info := label.new(time, low, "no footprint", xloc = xloc.bar_time, yloc = yloc.price,
+             color = color.new(color.gray, 85), style = label.style_label_up, textcolor = color.gray, size = size.tiny,
+             tooltip = "request.footprint() returned na for this candle: no intrabar data for it, no volume, or the account plan cannot request footprints.")
+    else if a.n == 0 or not (tot > 0)
+        d.hasData := true
+        d.zeroVol := true
+        d.info := label.new(time, low, "V 0", xloc = xloc.bar_time, yloc = yloc.price,
+             color = color.new(color.gray, 85), style = label.style_label_up, textcolor = color.gray, size = summarySize,
+             tooltip = "The footprint for this candle has zero total volume, so there are no cells to draw and delta % is undefined.")
+    else
+        d.hasData := true
+        // Visible row window. If the candle has more rows than allowed, keep the rows around the POC and
+        // report the rest as hidden. Rows are never merged; every value shown is TradingView's own row.
+        int R     = maxRowsInput
+        int start = 0
+        int count = a.n
+        if a.n > R
+            int center = a.pocIdx >= 0 ? a.pocIdx : math.floor(a.n / 2)
+            start := math.max(0, math.min(a.n - R, center - math.floor(R / 2)))
+            count := R
+        int stop = start + count - 1
+        d.rows   := a.n
+        d.hidden := a.n - count
+        // Cells: pass 0 draws normal cells, pass 1 draws imbalance cells on top so their borders stay visible.
+        for pass = 0 to 1
+            for i = start to stop
+                float top = a.up.get(i)
+                float bot = a.dn.get(i)
+                float b   = a.buy.get(i)
+                float s   = a.sell.get(i)
+                bool  bi  = showImbInput and a.bImb.get(i)
+                bool  si  = showImbInput and a.sImb.get(i)
+                if isBS
+                    if (pass == 1) == si
+                        d.boxes.push(drawCell(xOuterL, xInnerL, top, bot, fmtVol(s),
+                             cellBg(sellColInput, a.maxSide > 0 ? s / a.maxSide : 0.0), si, sellImbColInput))
+                    if (pass == 1) == bi
+                        d.boxes.push(drawCell(xInnerR, xOuterR, top, bot, fmtVol(b),
+                             cellBg(buyColInput, a.maxSide > 0 ? b / a.maxSide : 0.0), bi, buyImbColInput))
+                else
+                    if (pass == 1) == (bi or si)
+                        float dv     = b - s
+                        color side   = dv > 0 ? buyColInput : dv < 0 ? sellColInput : color.gray
+                        color imbCol = bi and si ? chart.fg_color : bi ? buyImbColInput : sellImbColInput
+                        string cellTxt = fmtSigned(dv) + (bi ? " ▲" : "") + (si ? " ▼" : "")
+                        d.boxes.push(drawCell(xInnerR, xOuterR, top, bot, cellTxt,
+                             cellBg(side, a.maxAbsDelta > 0 ? math.abs(dv) / a.maxAbsDelta : 0.0), bi or si, imbCol))
+        // Value area frame (clipped to the visible window) and POC frame, drawn above the cells.
+        if showVaInput and a.vahIdx >= 0 and a.valIdx >= 0
+            int vaTop = math.min(a.vahIdx, stop)
+            int vaBot = math.max(a.valIdx, start)
+            if vaTop >= vaBot
+                d.boxes.push(box.new(xFrameL, a.up.get(vaTop), xOuterR, a.dn.get(vaBot), border_color = vaColInput,
+                     border_width = 1, border_style = line.style_dashed, xloc = xloc.bar_time, bgcolor = na))
+        if showPocInput and a.pocIdx >= start and a.pocIdx <= stop
+            d.boxes.push(box.new(xFrameL, a.up.get(a.pocIdx), xOuterR, a.dn.get(a.pocIdx), border_color = pocColInput,
+                 border_width = 2, xloc = xloc.bar_time, bgcolor = na))
+        // Stacked imbalances: a bar in the outer margin beside the stacked rows (sell left, buy right).
+        if showStackInput
+            for [k, rs] in a.sRunS
+                int lo = math.max(rs, start)
+                int hi = math.min(a.sRunE.get(k), stop)
+                if lo <= hi
+                    d.lines.push(line.new(xStackL, a.dn.get(lo), xStackL, a.up.get(hi), xloc = xloc.bar_time,
+                         color = sellImbColInput, width = 3))
+            for [k, rs] in a.bRunS
+                int lo = math.max(rs, start)
+                int hi = math.min(a.bRunE.get(k), stop)
+                if lo <= hi
+                    d.lines.push(line.new(xStackR, a.dn.get(lo), xStackR, a.up.get(hi), xloc = xloc.bar_time,
+                         color = buyImbColInput, width = 3))
+        // Summary label under the candle. Shown when enabled, and always when rows are hidden.
+        if showSummaryInput or d.hidden > 0
+            string txt = showSummaryInput ? "V " + fmtVol(tot) + "\nΔ " + fmtSigned(dlt) + "\nΔ% " + fmtPct(pct) : ""
+            if d.hidden > 0
+                txt += (txt == "" ? "" : "\n") + "⚠ " + str.tostring(d.hidden) + " rows hidden"
+            if live
+                txt += "\n● live"
+            string pocTxt  = a.pocIdx >= 0 ? fmtPrice(a.dn.get(a.pocIdx)) + "–" + fmtPrice(a.up.get(a.pocIdx)) : "n/a"
+            string vaTxt   = a.vahIdx >= 0 and a.valIdx >= 0 ? fmtPrice(a.dn.get(a.valIdx)) + "–" + fmtPrice(a.up.get(a.vahIdx)) : "n/a"
+            string rowsTxt = d.hidden > 0 ? str.format("{0} rows, {1} shown ({2} below and {3} above hidden: raise Ticks per row or Max rows)", a.n, count, start, a.n - 1 - stop) : str.format("{0} rows, all shown", a.n)
+            string tip = str.format("Buy {0} · Sell {1} · Total {2}\nDelta {3} ({4})\nPOC {5}\nValue area {6} ({7}% target)\nImbalances: buy {8}, sell {9} · stacked buy {10}, stacked sell {11}\n{12}\nBuy/sell = TradingView intrabar up/down classification, not exchange aggressor data.{13}",
+                 fmtVol(buy), fmtVol(sell), fmtVol(tot), fmtSigned(dlt), fmtPct(pct), pocTxt, vaTxt, vaInput,
+                 a.bImbCount, a.sImbCount, a.bRunS.size(), a.sRunS.size(), rowsTxt,
+                 live ? "\nOPEN CANDLE: values are provisional until it closes." : "")
+            color dc = dlt > 0 ? buyColInput : dlt < 0 ? sellColInput : color.gray
+            d.info := label.new(time, math.min(low, a.dn.get(start)), txt, xloc = xloc.bar_time, yloc = yloc.price,
+                 color = color.new(dc, 80), style = label.style_label_up, textcolor = chart.fg_color, size = summarySize,
+                 tooltip = tip)
+    d
+
+// Status panel: data availability, omitted candles or rows, and how to fix them.
+updateStatus(table t, array<Drawn> q, int fpBarsSeen) =>
+    array<string> notes = array.new<string>()
+    bool warn = false
+    int   shown       = q.size()
+    int   noData      = 0
+    int   zeroVol     = 0
+    int   hiddenCount = 0
+    int   dataCount   = 0
+    int   rowsSum     = 0
+    float rangeSum    = 0.0
+    float maxRangeHid = 0.0
+    for d in q
+        if not d.hasData
+            noData += 1
+        else
+            dataCount += 1
+            rowsSum   += d.rows
+            rangeSum  += d.rangeTicks
+            zeroVol   += d.zeroVol ? 1 : 0
+            if d.hidden > 0
+                hiddenCount += 1
+                maxRangeHid := math.max(maxRangeHid, d.rangeTicks)
+    if fpBarsSeen == 0
+        warn := true
+        notes.push("⚠ No footprint data on this chart (request.footprint() returned na on every bar).")
+        notes.push("⚠ Needs a Premium/Ultimate plan, a symbol with volume and a time-based chart.")
+    else if noData > 0
+        warn := true
+        notes.push(str.format("⚠ No footprint for {0} of the {1} most recent candles (limited intrabar history?).", noData, shown))
+    if syminfo.volumetype == "n/a"
+        warn := true
+        notes.push("⚠ This symbol reports no volume.")
+    else if syminfo.volumetype == "tick"
+        notes.push("ℹ Volume here is tick volume (count of price updates), not traded size.")
+    if not chart.is_standard
+        warn := true
+        notes.push("⚠ Non-standard chart type: rows use real prices and may not line up with these bars.")
+    if capacity < candlesInput
+        warn := true
+        notes.push(str.format("⚠ Showing {0} of {1} candles: each reserves {2} boxes (500 max). Lower Max rows or use Delta mode.", capacity, candlesInput, boxesPerCandle))
+    if hiddenCount > 0
+        warn := true
+        int suggest = math.ceil(maxRangeHid / math.max(1, maxRowsInput - 1))
+        notes.push(str.format("⚠ Rows hidden on {0} candle(s) (max {1} per candle). Ticks per row ≥ {2} would show all rows.", hiddenCount, maxRowsInput, suggest))
+    if dataCount > zeroVol and ticksInput > 1
+        float avgRows = rowsSum / math.max(1, dataCount - zeroVol)
+        if avgRows < 4
+            int suggest = math.max(1, math.round(rangeSum / dataCount / 12))
+            notes.push(str.format("ℹ Only {0} rows per candle on average. Try Ticks per row ≈ {1}.", str.tostring(avgRows, "#.#"), suggest))
+    if zeroVol > 0
+        notes.push(str.format("ℹ Zero footprint volume on {0} candle(s).", zeroVol))
+    table.clear(t, 0, 0, 0, STATUS_ROWS - 1)
+    if statusInput == ST_ALWAYS or (statusInput == ST_NOTICE and warn)
+        table.cell(t, 0, 0, str.format("Footprint · {0} ticks/row = {1} · VA {2}% · imbalance {3}% ({4})", ticksInput,
+             fmtPrice(ticksInput * syminfo.mintick), vaInput, imbInput, useNative ? "native" : "script"),
+             text_color = chart.fg_color, text_halign = text.align_left, text_size = size.small)
+        table.cell(t, 0, 1, "Buy/sell = TradingView intrabar up/down estimate, not exchange aggressor data." + (barstate.isrealtime ? " Open candle is provisional." : ""),
+             text_color = color.gray, text_halign = text.align_left, text_size = size.small)
+        int r = 2
+        for msg in notes
+            if r < STATUS_ROWS
+                table.cell(t, 0, r, msg, text_color = str.startswith(msg, "⚠") ? #FF9800 : color.gray,
+                     text_halign = text.align_left, text_size = size.small)
+                r += 1
+
+// ═══════════════════════════════════════════ Main flow ═══════════════════════════════════════════
+[fpTotal, fpBuy, fpSell, fpDelta, fpDeltaPct] = candleMetrics(fp)
+
+var int fpBarsSeen = 0
+if hasFp
+    fpBarsSeen += 1
+
+// Row analysis is needed only for candles that are drawn and for live bars (alerts); skipping older bars
+// keeps the script fast.
+bool inWindow = barstate.isrealtime or bar_index > last_bar_index - capacity
+FpAnalysis fa = na
+if hasFp and inWindow
+    fa := analyzeFootprint(fp)
+
+// FIFO of rendered candles. On a new bar the oldest candle is deleted before the new one is drawn. On the open
+// candle, Pine's rollback removes the previous tick's drawings, so its footprint is simply redrawn each tick.
+var array<Drawn> drawn = array.new<Drawn>()
+if inWindow
+    while drawn.size() >= capacity
+        deleteDrawn(drawn.shift())
+    drawn.push(renderCandle(fa, fpTotal, fpBuy, fpSell, fpDelta, fpDeltaPct, not barstate.isconfirmed))
+
+var table statusTbl = table.new(statusPos, 1, STATUS_ROWS, bgcolor = color.new(chart.bg_color, 8),
+     frame_color = color.new(chart.fg_color, 75), frame_width = 1)
+if barstate.islast
+    updateStatus(statusTbl, drawn, fpBarsSeen)
+
+// ═══════════════════════════════════════════ 4 · Alerts ══════════════════════════════════════════
+// Confirmed mode evaluates only on the closing tick (barstate.isconfirmed) and uses once-per-bar-close
+// frequency, so each candle can fire each alert at most once. Live mode fires at most once per candle.
+bool  alertGate   = confirmedAl ? barstate.isconfirmed : true
+int   bRuns       = na(fa) ? 0 : fa.bRunS.size()
+int   sRuns       = na(fa) ? 0 : fa.sRunS.size()
+float deltaMetric = deltaUnitInput == DU_VOL ? fpDelta : fpDeltaPct
+bool  deltaValid  = hasFp and fpTotal > 0 and not na(deltaMetric)
+
+bool stackBuyEvent  = alertGate and bRuns > 0
+bool stackSellEvent = alertGate and sRuns > 0
+bool deltaPosEvent  = alertGate and deltaValid and deltaMetric > deltaThreshInput
+bool deltaNegEvent  = alertGate and deltaValid and deltaMetric < -deltaThreshInput
+
+string alertFreq = confirmedAl ? alert.freq_once_per_bar_close : alert.freq_once_per_bar
+string liveNote  = confirmedAl ? "" : " · provisional (candle still open)"
+string unitTxt   = deltaUnitInput == DU_VOL ? fmtVol(deltaThreshInput) : str.tostring(deltaThreshInput) + "%"
+
+if alStackBuyInput and stackBuyEvent
+    alert(str.format("{0} {1} · Stacked BUY imbalance · {2} · delta {3} ({4}){5}", syminfo.ticker, timeframe.period,
+         stackText(fa.bRunS, fa.bRunE, fa), fmtSigned(fpDelta), fmtPct(fpDeltaPct), liveNote), alertFreq)
+if alStackSellInput and stackSellEvent
+    alert(str.format("{0} {1} · Stacked SELL imbalance · {2} · delta {3} ({4}){5}", syminfo.ticker, timeframe.period,
+         stackText(fa.sRunS, fa.sRunE, fa), fmtSigned(fpDelta), fmtPct(fpDeltaPct), liveNote), alertFreq)
+if alDeltaPosInput and deltaPosEvent
+    alert(str.format("{0} {1} · Candle delta {2} ({3}) above +{4}{5}", syminfo.ticker, timeframe.period,
+         fmtSigned(fpDelta), fmtPct(fpDeltaPct), unitTxt, liveNote), alertFreq)
+if alDeltaNegInput and deltaNegEvent
+    alert(str.format("{0} {1} · Candle delta {2} ({3}) below −{4}{5}", syminfo.ticker, timeframe.period,
+         fmtSigned(fpDelta), fmtPct(fpDeltaPct), unitTxt, liveNote), alertFreq)
+
+// alertcondition() versions for the "Create alert" dialog (choose the condition, frequency "Once per bar").
+alertcondition(alStackBuyInput and stackBuyEvent, "Footprint: stacked buy imbalance",
+     'Stacked buy imbalance on {{ticker}} {{interval}} · delta {{plot("FP delta")}}')
+alertcondition(alStackSellInput and stackSellEvent, "Footprint: stacked sell imbalance",
+     'Stacked sell imbalance on {{ticker}} {{interval}} · delta {{plot("FP delta")}}')
+alertcondition(alDeltaPosInput and deltaPosEvent, "Footprint: positive delta beyond threshold",
+     'Positive footprint delta on {{ticker}} {{interval}}: {{plot("FP delta")}} ({{plot("FP delta %")}}%)')
+alertcondition(alDeltaNegInput and deltaNegEvent, "Footprint: negative delta beyond threshold",
+     'Negative footprint delta on {{ticker}} {{interval}}: {{plot("FP delta")}} ({{plot("FP delta %")}}%)')
+
+// ═══════════════════════════════════════════ Data Window values ══════════════════════════════════
+// Not drawn on the chart. Hover a candle to check the numbers; alert messages use them as placeholders.
+plot(fpTotal, "FP total volume", color.gray, display = display.data_window)
+plot(fpBuy, "FP buy volume", buyColInput, display = display.data_window)
+plot(fpSell, "FP sell volume", sellColInput, display = display.data_window)
+plot(fpDelta, "FP delta", fpDelta >= 0 ? buyColInput : sellColInput, display = display.data_window)
+plot(fpDeltaPct, "FP delta %", fpDelta >= 0 ? buyColInput : sellColInput, display = display.data_window)
+plot(na(fa) ? na : bRuns, "Stacked buy runs", buyImbColInput, display = display.data_window)
+plot(na(fa) ? na : sRuns, "Stacked sell runs", sellImbColInput, display = display.data_window)

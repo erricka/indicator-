@@ -132,6 +132,18 @@ has the same ICT features as the web chart, plus:
 
 See [`pine/README.md`](pine/README.md) for installation and an explanation of every calculation.
 
+### Footprint overlay
+
+[`pine/footprint_overlay.pine`](pine/footprint_overlay.pine) is a separate Pine Script v6 indicator that
+draws TradingView's own volume footprint rows on the price chart. It needs a Premium or Ultimate plan.
+- sell volume on the left of each candle and buy volume on the right, or a delta column;
+- POC, value area, diagonal and stacked imbalances;
+- a summary of volume, delta and delta % below each candle;
+- alerts on candle close.
+
+Buy and sell are TradingView's intrabar up/down classification, not exchange aggressor data.
+See [`pine/FOOTPRINT.md`](pine/FOOTPRINT.md) for installation, limitations and a worked example.
+
 ## Project layout
 
 ```
@@ -143,6 +155,8 @@ public/js/app.js       chart, dashboard, controls, live updates
 public/js/theme.js     colour system (dark + light)
 pine/clarity_smc.pine  TradingView version (v2: volume statistics, stop loss / take profit)
 pine/README.md         how every Pine calculation works
+pine/footprint_overlay.pine  TradingView volume footprint overlay (request.footprint)
+pine/FOOTPRINT.md      footprint overlay guide: limits, calculations, checklist
 test/                  engine and server tests (node --test)
 ```
 
