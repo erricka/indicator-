@@ -144,11 +144,19 @@ draws TradingView's own volume footprint rows on the price chart. It needs a Pre
 Buy and sell are TradingView's intrabar up/down classification, not exchange aggressor data.
 See [`pine/FOOTPRINT.md`](pine/FOOTPRINT.md) for installation, limitations and a worked example.
 
+### Pine scripts page
+
+The web app has a **Pine scripts** page at [`/pine`](https://clarity-smc.onrender.com/pine), linked from the top bar.
+It shows both indicators with line numbers and has **Copy code** and **Download .pine** buttons. Copy from
+there rather than through a chat app: messaging apps turn text such as `8)` into emoji, which breaks
+the script.
+
 ## Project layout
 
 ```
 server.js              zero-dependency Node server + market-data proxy
 public/index.html      app shell
+public/pine.html       Pine scripts page: view, copy and download the indicators
 public/js/engine.js    signal engine (pure, shared with tests)
 public/js/overlay.js   canvas overlay: zones, lines, bubbles, collision-free labels
 public/js/app.js       chart, dashboard, controls, live updates

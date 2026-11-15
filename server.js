@@ -20,6 +20,12 @@ const VENDOR = {
   ),
 };
 
+// Pine Script files and guides shown on the /pine page, served read-only as plain text (allowlist only).
+const PINE_FILES = Object.fromEntries(
+  ['footprint_overlay.pine', 'clarity_smc.pine', 'FOOTPRINT.md', 'README.md']
+    .map((name) => [`/pine/${name}`, path.join(ROOT, 'pine', name)]),
+);
+
 export const TIMEFRAMES = {
   '1m': { sec: 60, binance: '1m', kraken: 1, yahoo: { interval: '1m', range: '5d' } },
   '5m': { sec: 300, binance: '5m', kraken: 5, yahoo: { interval: '5m', range: '1mo' } },
@@ -345,6 +351,8 @@ const TYPES = {
   '.ico': 'image/x-icon',
   '.json': 'application/json; charset=utf-8',
   '.webmanifest': 'application/manifest+json',
+  '.pine': 'text/plain; charset=utf-8',
+  '.md': 'text/plain; charset=utf-8',
 };
 
 const SECURITY_HEADERS = {
@@ -377,18 +385,20 @@ const fileCache = new Map();
 async function loadFile(file) {
   if (process.env.NODE_ENV === 'production' && fileCache.has(file)) return fileCache.get(file);
   let buf = await readFile(file);
-  if (file.endsWith('index.html')) buf = Buffer.from(buf.toString('utf8').replaceAll('__BUILD__', BUILD_ID));
+  if (file.endsWith('.html')) buf = Buffer.from(buf.toString('utf8').replaceAll('__BUILD__', BUILD_ID));
   const entry = { buf, etag: `"${createHash('sha1').update(buf).digest('base64url').slice(0, 20)}"` };
   fileCache.set(file, entry);
   return entry;
 }
 
 async function serveStatic(req, res, pathname) {
-  let file = VENDOR[pathname];
+  let file = VENDOR[pathname] || PINE_FILES[pathname];
   if (!file) {
     let rel;
     try {
-      rel = pathname === '/' ? 'index.html' : decodeURIComponent(pathname).replace(/^\/+/, '');
+      if (pathname === '/') rel = 'index.html';
+      else if (pathname === '/pine' || pathname === '/pine/') rel = 'pine.html';
+      else rel = decodeURIComponent(pathname).replace(/^\/+/, '');
     } catch {
       return send(res, 400, 'Bad request');
     }

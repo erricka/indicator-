@@ -169,6 +169,8 @@ button:focus-visible, input:focus-visible {
   font-size: 12px;
 }
 .tool-btn svg { width: 16px; height: 16px; }
+a.tool-btn { color: inherit; text-decoration: none; }
+a.tool-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .tool-btn:hover, .icon-btn:hover { background: var(--hover); }
 .tool-btn[aria-expanded="true"] { background: var(--active); border-color: var(--accent); }
 

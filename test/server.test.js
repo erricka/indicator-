@@ -46,6 +46,27 @@ test('serves the chart library and app modules', async () => {
   assert.match(await mod.text(), /export function analyze/);
 });
 
+test('serves the Pine scripts page and the allowlisted script files', async () => {
+  const page = await fetch(`${base}/pine`);
+  assert.equal(page.status, 200);
+  assert.match(page.headers.get('content-type'), /text\/html/);
+  const html = await page.text();
+  assert.match(html, /<title>Pine Scripts<\/title>/);
+  assert.doesNotMatch(html, /__BUILD__/);
+  for (const [file, marker] of [['footprint_overlay.pine', /request\.footprint\(/], ['clarity_smc.pine', /\/\/@version=6/]]) {
+    const res = await fetch(`${base}/pine/${file}`);
+    assert.equal(res.status, 200, file);
+    assert.match(res.headers.get('content-type'), /^text\/plain/);
+    assert.match(await res.text(), marker);
+  }
+  assert.equal((await fetch(`${base}/pine/FOOTPRINT.md`)).status, 200);
+  // Only allowlisted files are exposed; other repo files stay private.
+  assert.equal((await fetch(`${base}/pine/notes.txt`)).status, 404);
+  assert.equal((await fetch(`${base}/server.js`)).status, 404);
+  const escape = await fetch(`${base}/pine/..%2F..%2Fserver.js`);
+  assert.ok([403, 404].includes(escape.status), `traversal returned ${escape.status}`);
+});
+
 test('health check, validation and path traversal', async () => {
   assert.equal((await fetch(`${base}/healthz`)).status, 200);
   const bad = await fetch(`${base}/api/candles?symbol=BTCUSDT&tf=7m`);
